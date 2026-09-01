@@ -196,8 +196,11 @@ NetworkPolicy plus the validated cluster id (see the next section). Neither work
 from outside the cluster — remote/off-cluster access is deferred, and needs an
 owner-scoped address endpoint Bifrost does not have yet.
 
-If Ray Client hangs or is refused while job submission works, the cause is almost
-always the owner-match caveat above, not the address.
+An owner mismatch does **not** show up as "Ray Client is broken but jobs work":
+one NetworkPolicy rule guards `:10001` and `:8265` together, so both die at once
+while the Bifrost control plane keeps answering. If Ray Client hangs _and_ job
+submission fails while start/stop/list are fine, suspect the owner label, not the
+address.
 
 ## Approved profiles, and why every profile must set `ttl_seconds`
 
