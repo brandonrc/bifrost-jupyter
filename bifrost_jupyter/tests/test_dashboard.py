@@ -20,6 +20,7 @@ from tornado.httpclient import HTTPClientError, HTTPResponse
 from tornado.httputil import HTTPHeaders
 
 from bifrost_jupyter import _dashboard, handlers
+from bifrost_jupyter.tests import ROUTE_SSRF_IDS
 
 INDEX_HTML = b'<!DOCTYPE html><html><head><script src="./static/js/main.js"></script></head></html>'
 
@@ -264,3 +265,46 @@ async def test_dashboard_head_proxies_without_a_body(jp_fetch, ray_dashboard):
     assert resp.body in (b"", None)
     assert server.requests[0].method == "HEAD"
     assert server.requests[0].url == "http://cl-1-head-svc.bifrost.svc:8265/"
+
+
+#
+# SSRF regression: an unvalidated cluster id used to pick the host the *server*
+# connects to. Every payload must be a clean 400 with no upstream request.
+#
+
+
+@pytest.mark.parametrize("cluster_id", ROUTE_SSRF_IDS)
+async def test_dashboard_rejects_a_malformed_cluster_id(jp_fetch, ray_dashboard, cluster_id):
+    server = ray_dashboard()
+
+    with pytest.raises(HTTPClientError) as exc:
+        await jp_fetch("bifrost", "clusters", cluster_id, "dashboard/")
+    assert exc.value.code == 400
+    assert "invalid cluster id" in exc.value.response.body.decode()
+    # The load-bearing half: the server never opened a connection.
+    assert server.requests == []
+
+
+@pytest.mark.parametrize("cluster_id", ROUTE_SSRF_IDS)
+async def test_dashboard_redirect_rejects_a_malformed_cluster_id(
+    jp_fetch, ray_dashboard, cluster_id
+):
+    # The slash-less form must not 302 a hostile id into the proxy either.
+    server = ray_dashboard()
+
+    with pytest.raises(HTTPClientError) as exc:
+        await jp_fetch("bifrost", "clusters", cluster_id, "dashboard", follow_redirects=False)
+    assert exc.value.code == 400
+    assert server.requests == []
+
+
+async def test_dashboard_reviewer_repro_reaches_no_attacker_host(jp_fetch, ray_dashboard):
+    # The exact reported request: GET /bifrost/clusters/evil.example%3A9999%3F/dashboard/
+    # used to fetch http://evil.example:9999?-head-svc.bifrost.svc:8265/ and reflect
+    # the body back.
+    server = ray_dashboard()
+
+    with pytest.raises(HTTPClientError) as exc:
+        await jp_fetch("bifrost", "clusters", "evil.example:9999?", "dashboard/")
+    assert exc.value.code == 400
+    assert server.requests == []

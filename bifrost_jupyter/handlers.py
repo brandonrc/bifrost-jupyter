@@ -9,16 +9,21 @@ matching HTTP status.
 Two families of route live here. Most are JSON APIs backed by Bifrost. The
 exceptions are the in-cluster routes — ``/clusters/{id}/jobs*`` and
 ``/clusters/{id}/dashboard*`` — which talk straight to the cluster's own Ray head
-service with no Bifrost credential at all; the per-owner NetworkPolicy is the
-gate there. The dashboard route additionally serves HTML/JS rather than JSON, so
-it is the one handler that is not an ``APIHandler`` (see
+service with no Bifrost credential at all; there the gate is the per-owner
+NetworkPolicy *plus* the validated cluster id that pins the target (see
+:class:`_ClusterIdMixin`). The dashboard route additionally serves HTML/JS rather
+than JSON, so it is the one handler that is not an ``APIHandler`` (see
 :class:`_ClusterDashboardBase`).
+
+Every route taking an ``{id}`` path segment validates it first — control-plane
+routes included, since the id also lands in the Bifrost URL.
 """
 
 from __future__ import annotations
 
 import http.client
 import json
+from typing import Any
 from urllib.parse import quote
 
 import tornado
@@ -30,7 +35,42 @@ from .bifrost import BifrostAPIError, BifrostConfigError, client_from_env
 from .config import default_namespace
 
 
-class _BifrostHandler(APIHandler):
+class _ClusterIdMixin:
+    """The single guard every ``{id}``-taking route runs first.
+
+    A cluster id is a path segment the caller fully controls, and it is
+    interpolated into the head-service host (``<id>-head-svc.<ns>.svc``) and into
+    the Bifrost control-plane URL. Unvalidated, an id like ``evil.example:9999?``
+    restructures that URL and picks the host the *server* connects to — a blind
+    SSRF from inside the cluster network, reachable by any external page riding
+    the victim's ambient Jupyter cookie on a plain ``GET``.
+
+    So validation lives in exactly one place (:func:`_address.validate_cluster_id`)
+    and every route funnels through this mixin. Subclasses supply ``_fail`` so the
+    400 is rendered in whatever the route's content type is.
+    """
+
+    #: Provided by the tornado handler this is mixed into.
+    log: Any
+
+    def _fail(self, status: int, message: str) -> None:
+        raise NotImplementedError  # pragma: no cover - supplied by subclasses
+
+    def _check_cluster_id(self, cluster_id: str) -> bool:
+        """Answer a clean 400 and return ``False`` for a malformed id."""
+        try:
+            _address.validate_cluster_id(cluster_id)
+        except _address.InvalidClusterIdError:
+            # Logged at warning, not error, and without the id: a malformed id is
+            # a rejected request, not a server fault, and echoing attacker input
+            # into the ServerApp log is its own small hazard.
+            self.log.warning("bifrost: rejected a malformed cluster id")
+            self._fail(400, "invalid cluster id")
+            return False
+        return True
+
+
+class _BifrostHandler(_ClusterIdMixin, APIHandler):
     """Shared error handling for Bifrost-backed routes."""
 
     def _fail(self, status: int, message: str) -> None:
@@ -162,6 +202,8 @@ class ClusterAddressHandler(_BifrostHandler):
 
     @tornado.web.authenticated
     def get(self, cluster_id: str) -> None:
+        if not self._check_cluster_id(cluster_id):
+            return
         namespace = self.settings["bifrost_cluster_namespace"]
         self.finish(
             json.dumps(
@@ -184,6 +226,8 @@ class ClusterHandler(_BifrostHandler):
 
     @tornado.web.authenticated
     def delete(self, cluster_id: str) -> None:
+        if not self._check_cluster_id(cluster_id):
+            return
         client = self._write_client_or_fail("stop")
         if client is None:
             return
@@ -209,6 +253,8 @@ class ClusterLifecycleHandler(_BifrostHandler):
 
     @tornado.web.authenticated
     def post(self, cluster_id: str, action: str) -> None:
+        if not self._check_cluster_id(cluster_id):
+            return
         client = self._write_client_or_fail(action)
         if client is None:
             return
@@ -228,10 +274,12 @@ class _RayJobsHandler(_BifrostHandler):
     cluster's own Ray head service (``<id>-head-svc.<ns>.svc:8265``), exactly
     like ``/clusters/{id}/address``. The jupyter-server extension runs inside the
     user's notebook pod, which carries the ``bifrost.dev/owner`` label, so the
-    per-owner NetworkPolicy admits it to :8265 — the NetworkPolicy is the gate,
-    **not** a bearer token. There is deliberately no ``Authorization`` header on
-    this path and none should be added; the Bifrost credential is only for the
-    control plane (create/list/delete/suspend/resume).
+    per-owner NetworkPolicy admits it to :8265. The gate here is that NetworkPolicy
+    **plus** the validated cluster id (see :class:`_ClusterIdMixin`) that pins the
+    target to a head service in the configured namespace — **not** a bearer token.
+    There is deliberately no ``Authorization`` header on this path and none should
+    be added; the Bifrost credential is only for the control plane
+    (create/list/delete/suspend/resume).
 
     A consequence worth stating: since no Bifrost client is constructed, these
     routes keep working on an install where Bifrost is unconfigured — the address
@@ -254,6 +302,8 @@ class ClusterJobsHandler(_RayJobsHandler):
 
     @tornado.web.authenticated
     async def post(self, cluster_id: str) -> None:
+        if not self._check_cluster_id(cluster_id):
+            return
         try:
             payload = json.loads(self.request.body or b"{}")
         except json.JSONDecodeError:
@@ -296,6 +346,8 @@ class ClusterJobHandler(_RayJobsHandler):
 
     @tornado.web.authenticated
     async def get(self, cluster_id: str, job_id: str) -> None:
+        if not self._check_cluster_id(cluster_id):
+            return
         try:
             view = await _jobs.get_job(self._jobs_address(cluster_id), job_id)
         except _jobs.RayJobsError as exc:
@@ -304,7 +356,7 @@ class ClusterJobHandler(_RayJobsHandler):
         self.finish(json.dumps(view))
 
 
-class _ClusterDashboardBase(JupyterHandler):
+class _ClusterDashboardBase(_ClusterIdMixin, JupyterHandler):
     """Base for the two Ray-dashboard routes (task 8).
 
     Deliberately :class:`~jupyter_server.base.handlers.JupyterHandler` and **not**
@@ -318,6 +370,12 @@ class _ClusterDashboardBase(JupyterHandler):
     Auth is Jupyter's own (``@tornado.web.authenticated``); no Bifrost credential
     is involved and none is sent upstream — see :mod:`bifrost_jupyter._dashboard`.
     """
+
+    def _fail(self, status: int, message: str) -> None:
+        # Plain text, not JSON: the browser is the consumer on these routes.
+        self.set_status(status)
+        self.set_header("Content-Type", "text/plain; charset=UTF-8")
+        self.finish(message)
 
     def _dashboard_prefix(self, cluster_id: str) -> str:
         """The proxy mount path for this cluster, trailing slash included."""
@@ -340,10 +398,14 @@ class ClusterDashboardRedirectHandler(_ClusterDashboardBase):
 
     @tornado.web.authenticated
     def get(self, cluster_id: str) -> None:
+        if not self._check_cluster_id(cluster_id):
+            return
         self.redirect(self._dashboard_prefix(cluster_id))
 
     @tornado.web.authenticated
     def head(self, cluster_id: str) -> None:
+        if not self._check_cluster_id(cluster_id):
+            return
         self.redirect(self._dashboard_prefix(cluster_id))
 
 
@@ -365,6 +427,11 @@ class ClusterDashboardHandler(_ClusterDashboardBase):
         await self._proxy(cluster_id, rest, "HEAD")
 
     async def _proxy(self, cluster_id: str, rest: str, method: str) -> None:
+        # Before anything else: an unvalidated id picks the host this server
+        # connects to. See ``_ClusterIdMixin``.
+        if not self._check_cluster_id(cluster_id):
+            return
+
         namespace = self.settings["bifrost_cluster_namespace"]
         origin = _address.dashboard_address(cluster_id, namespace)
         prefix = self._dashboard_prefix(cluster_id)
@@ -377,11 +444,9 @@ class ClusterDashboardHandler(_ClusterDashboardBase):
             )
         except _dashboard.DashboardError as exc:
             # A cluster that is starting, stopped or suspended is unreachable,
-            # not an error in this extension: answer plainly (the browser, not
-            # the panel, is the consumer here) and never echo the address.
-            self.set_status(exc.status)
-            self.set_header("Content-Type", "text/plain; charset=UTF-8")
-            self.finish(exc.message)
+            # not an error in this extension: answer plainly and never echo the
+            # address.
+            self._fail(exc.status, exc.message)
             return
 
         # ``set_status`` rejects a code tornado has no reason phrase for, which

@@ -34,11 +34,16 @@ origin, not just this extension, and not tied to the caller's own clusters. More
 dependency, more surface, less scoping, for rewriting Ray does not need.
 
 **No Bifrost credential on this path**, exactly like :mod:`bifrost_jupyter._jobs`:
-the address is derived from ``(cluster id, namespace)`` and reachability *is* the
-authorization. Nothing is sent upstream either — in particular the browser's
-``Cookie`` (Jupyter's session + XSRF cookie) and ``Authorization`` headers are
-**not** forwarded to the Ray head, and only an allowlist of response headers
-comes back.
+the address is derived from ``(cluster id, namespace)``. Two things together stand
+in for a token — the per-owner NetworkPolicy's reachability, **and** a cluster id
+validated by :func:`bifrost_jupyter._address.validate_cluster_id`, which is what
+pins the target to a head service in the configured namespace. Reachability alone
+would not be authorization: the id is a caller-controlled path segment, and an
+unvalidated one lets the caller pick the host the *server* connects to (see
+``handlers._ClusterIdMixin``). Nothing is sent upstream either — in particular the
+browser's ``Cookie`` (Jupyter's session + XSRF cookie) and ``Authorization``
+headers are **not** forwarded to the Ray head, and only an allowlist of response
+headers comes back.
 
 **GET/HEAD only.** Ray's docs warn that "the Ray Dashboard provides read *and*
 write access to the Ray Cluster". Proxying writes would mean exempting this route
