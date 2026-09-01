@@ -10,6 +10,25 @@ These read the package's own source with ``ast`` and fail if a new route can
 reintroduce either defect. They are deliberately about *shape*, not behaviour:
 the behavioural tests live next door, but they only cover routes someone
 remembered to write a test for.
+
+A guard that scans a clean codebase cannot fail, so it cannot tell you whether
+it still works — ``test_the_guard_would_catch_a_regression`` is what does that,
+by running the guard's own function over source that carries the defect. Two
+lessons are baked into how that test is written, both learned by having it fail
+to catch a real mutation:
+
+1. **Share the implementation, don't mirror it.** The regression test must call
+   the same function the guard calls. A hand-written copy of the matching logic
+   is blind to a regression in the original — the two drift, and the copy keeps
+   passing while the guard has stopped biting.
+2. **Cover every branch the real code uses.** Sharing is necessary but not
+   sufficient: the test only proves what its cases *exercise*. The matcher reads
+   both ``ast.Name`` and ``ast.Attribute``, and production code reaches almost
+   every blocking name as ``self.<name>`` — so a single bare-name case verified
+   the branch nothing in production uses. Hence
+   :data:`BLOCKING_ACCESS_SHAPES`: **when you add a name to**
+   :data:`BLOCKING_NAMES`, add it there in the access shape real code uses, not
+   just the name.
 """
 
 from __future__ import annotations
@@ -140,28 +159,51 @@ def test_no_synchronous_handler_touches_a_blocking_call():
     )
 
 
-def test_the_guard_would_catch_a_regression():
+#: Each blocking name in the access shape production code actually uses.
+#:
+#: The shapes matter more than the names. ``finds_blocking_call`` reads two
+#: different AST nodes — ``ast.Name`` for a bare call, ``ast.Attribute`` for
+#: ``self.<name>`` — and in real ``handlers.py`` all but one of these names only
+#: ever appear as attributes. A synthetic case using just the bare-name form
+#: exercises one branch and leaves the other unverified, which is how a matcher
+#: blinded to attributes once passed this suite.
+BLOCKING_ACCESS_SHAPES = {
+    # The only one that appears bare in handlers.py.
+    "client_from_env": "        client = client_from_env()\n",
+    # The rest are always reached through self.
+    "_client": "        client = self._client()\n",
+    "_blocking": "        return self._blocking(client.list_clusters)\n",
+    "_write_client_or_fail": "        client = self._write_client_or_fail('stop')\n",
+}
+
+
+def test_every_blocking_name_has_a_regression_case():
+    """Adding a name to ``BLOCKING_NAMES`` without a case would leave it
+    unverified, so the omission fails here rather than passing quietly."""
+    assert set(BLOCKING_ACCESS_SHAPES) == BLOCKING_NAMES
+
+
+@pytest.mark.parametrize("name", sorted(BLOCKING_ACCESS_SHAPES))
+def test_the_guard_would_catch_a_regression(name):
     """The guard above passes trivially if its rule never matches anything.
 
-    Parse a synthetic handler carrying the exact defect and confirm
-    :func:`finds_blocking_call` — *the same function the guard calls*, not a
+    Parse a synthetic handler carrying the defect and confirm
+    :func:`scan_for_sync_blocking` — *the same function the guard calls*, not a
     second copy of its logic — flags it.
 
-    That sharing is the whole point, and an earlier version of this test got it
-    wrong: it re-implemented the extraction against the synthetic snippet, so
-    the two copies had only ``BLOCKING_NAMES`` in common. Neutering the real
-    guard's matching left this test green, which is precisely the blindness it
-    exists to prevent. Break the shared function now and both fail together.
+    Parametrized over every name in its real access shape, because sharing the
+    implementation is necessary but not sufficient: a shared-implementation
+    regression test only proves what its cases actually *exercise*. A single
+    bare-name case left the ``ast.Attribute`` branch — the shape describing
+    essentially every real regression — completely unverified.
     """
     source = (
         "class BadHandler(_BifrostHandler):\n"
-        "    def get(self):\n"
-        "        client = client_from_env()\n"
-        "        return client.list_clusters()\n"
+        "    def get(self):\n" + BLOCKING_ACCESS_SHAPES[name]
     )
     offenders = scan_for_sync_blocking(ast.parse(source))
-    assert offenders == ["BadHandler.get (line 2) uses ['client_from_env']"], (
-        f"the rule no longer detects the defect it exists for: {offenders}"
+    assert offenders == [f"BadHandler.get (line 2) uses ['{name}']"], (
+        f"the rule no longer detects {name} in its real access shape: {offenders}"
     )
 
 
