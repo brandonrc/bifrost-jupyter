@@ -4,10 +4,12 @@ The credential never reaches the browser: it is resolved here, inside the user's
 notebook pod, and attached to Bifrost control-plane calls by
 :mod:`bifrost_jupyter.bifrost`. Nothing in this module puts a token in a return
 value that a handler serializes, in a log line, or in an exception message.
-:class:`Credential` also refuses the generic ways an object gets dumped —
-``repr``/``str`` redact, and it is neither a dataclass nor an attribute bag, so
-``asdict``/``astuple``/``vars`` cannot walk past that. Reading ``.token`` is the
-one deliberate way out.
+:class:`Credential` and :class:`StaticCredential` additionally refuse five
+specific dumps — ``repr``/``str``, ``dataclasses.asdict``/``astuple``, ``vars``,
+``pickle``, and ``copy``/``deepcopy`` — each enumerated and tested on the class
+itself. That is a list of closed mechanisms, not a claim of opacity: the token
+is a string in memory and anything reading an object's internals directly still
+sees it. Reading ``.token`` is the one deliberate way out.
 
 Precedence, highest first
 ------------------------
@@ -67,6 +69,7 @@ import binascii
 import json
 import logging
 import os
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -74,8 +77,10 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Protocol
 
-from bifrost_client import ApiClient, ApiException, AuthApi, Configuration
+from bifrost_client import ApiException, AuthApi, Configuration
 from bifrost_client.models.create_token_request import CreateTokenRequest
+
+from ._apiclient import bounded_api_client
 
 #: OIDC access token injected by the JupyterHub ``auth_state`` hook. The *_FILE
 #: form is preferred: it is re-read on every refresh, so a rotating file (a
@@ -161,20 +166,32 @@ class CredentialError(RuntimeError):
 class Credential:
     """A resolved bearer token plus where it came from and when it dies.
 
-    Deliberately **not** a dataclass, and deliberately ``__slots__``-ed. Both are
-    load-bearing for the "the token does not escape" invariant, because
-    ``__repr__``/``__str__`` redaction alone is not opacity — it only covers the
-    ways a *string* is produced:
+    Five specific ways of dumping an object are closed, each because it would
+    otherwise walk the fields and hand back the plaintext token with the
+    ``__repr__``/``__str__`` redaction untouched:
 
-    * ``dataclasses.asdict``/``astuple`` walk the declared fields directly and
-      would hand back the plaintext token, redaction untouched. A plain class is
-      not a dataclass, so both raise ``TypeError``;
-    * ``vars()``/``__dict__`` would do the same for any ordinary attribute bag.
-      ``__slots__`` means there is no instance ``__dict__`` to dump.
+    * ``dataclasses.asdict``/``astuple`` — this is not a dataclass, so both raise
+      ``TypeError``;
+    * ``vars()``/``__dict__`` — ``__slots__``, so there is no instance dict;
+    * ``pickle.dumps`` and ``copy.copy``/``copy.deepcopy`` — ``__reduce__``,
+      ``__getstate__``, ``__copy__`` and ``__deepcopy__`` all raise. ``__slots__``
+      does **nothing** against these: Python's default slot-based
+      ``__reduce_ex__`` happily serialises the slot values, which is how a first
+      attempt at this class was falsified.
 
-    Reading ``.token`` is then the single deliberate way to get the secret out,
-    which is what the two call sites that need it do.
+    That list is exhaustive of what has been *tested*, not of what is possible.
+    Anything reaching into an object's internals directly — ``gc.get_referents``,
+    a debugger, a core dump — still sees the string, as it would for any object
+    holding one; the token is in memory and this class does not pretend
+    otherwise. What it buys is that no *ordinary* serialise-this-object reflex
+    leaks a credential.
+
+    Reading ``.token`` is the single deliberate way to get the secret out, which
+    is what the two call sites that need it do.
     """
+
+    #: One message for every refusal below.
+    _OPAQUE = "Credential is not serialisable or copyable — it holds a bearer token"
 
     __slots__ = ("_token", "source", "expires_at")
 
@@ -201,6 +218,21 @@ class Credential:
     def __str__(self) -> str:
         return self.__repr__()
 
+    # pickle (both the modern and legacy protocols route through these) and
+    # copy/deepcopy (which fall back to __reduce_ex__ when __copy__/__deepcopy__
+    # are absent). Raising here is what a __slots__ class does not get for free.
+    def __reduce__(self):  # type: ignore[no-untyped-def]
+        raise TypeError(self._OPAQUE)
+
+    def __getstate__(self):  # type: ignore[no-untyped-def]
+        raise TypeError(self._OPAQUE)
+
+    def __copy__(self):  # type: ignore[no-untyped-def]
+        raise TypeError(self._OPAQUE)
+
+    def __deepcopy__(self, memo):  # type: ignore[no-untyped-def]
+        raise TypeError(self._OPAQUE)
+
 
 class CredentialSource(Protocol):
     """What :class:`~bifrost_jupyter.bifrost.BifrostClient` needs of a credential."""
@@ -219,14 +251,28 @@ class CredentialSource(Protocol):
 class StaticCredential:
     """A fixed token — the dev/direct case and the shape tests construct.
 
-    ``__slots__`` for the same reason :class:`Credential` has it: no instance
-    ``__dict__``, so ``vars()`` cannot dump the token past ``__repr__``.
+    Refuses the same five dumps as :class:`Credential`, for the same reasons —
+    it holds the same kind of secret.
     """
 
     __slots__ = ("_token",)
 
+    _OPAQUE = "StaticCredential is not serialisable or copyable — it holds a bearer token"
+
     def __init__(self, token: str) -> None:
         self._token = token
+
+    def __reduce__(self):  # type: ignore[no-untyped-def]
+        raise TypeError(self._OPAQUE)
+
+    def __getstate__(self):  # type: ignore[no-untyped-def]
+        raise TypeError(self._OPAQUE)
+
+    def __copy__(self):  # type: ignore[no-untyped-def]
+        raise TypeError(self._OPAQUE)
+
+    def __deepcopy__(self, memo):  # type: ignore[no-untyped-def]
+        raise TypeError(self._OPAQUE)
 
     @property
     def refreshable(self) -> bool:
@@ -440,7 +486,13 @@ def mint_session_pat(api_url: str, bearer: Credential) -> Credential | None:
     session must continue on the OIDC token rather than fail.
     """
     try:
-        api = AuthApi(ApiClient(Configuration(host=api_url, access_token=bearer.token)))
+        # Bounded by the shared chokepoint (see ._apiclient): the mint runs on a
+        # worker thread during session start, and unbounded it would pin one.
+        api = AuthApi(
+            bounded_api_client(
+                Configuration(host=api_url, access_token=bearer.token), _HTTP_TIMEOUT_SECS
+            )
+        )
         response = api.create_token(
             CreateTokenRequest(label=_PAT_LABEL, expires_in_days=_pat_ttl_days())
         )
@@ -486,12 +538,20 @@ class CredentialResolver:
 
     One instance per server process (see :func:`session_resolver`), so the
     session-start work — the exchange, and the PAT mint when enabled — happens
-    once, not per request. Tornado runs single-threaded, so no locking.
+    once, not per request.
+
+    **Locked**, because the handlers run their blocking Bifrost work in a thread
+    executor: concurrent panel requests resolve on different threads, and without
+    the lock two of them racing a cold cache would each perform the exchange and
+    the mint. Held across the whole resolve (network included) so the second
+    caller waits and then finds the first one's result cached, rather than
+    duplicating it.
     """
 
     def __init__(self, api_url: str) -> None:
         self.api_url = api_url
         self._cached: Credential | None = None
+        self._lock = threading.Lock()
 
     @property
     def refreshable(self) -> bool:
@@ -504,8 +564,13 @@ class CredentialResolver:
         cached = self._cached
         if cached is not None and not cached.is_expired():
             return cached
-        resolved = self._resolve()
-        self._cached = resolved
+        with self._lock:
+            # Re-check: another thread may have resolved while we waited.
+            cached = self._cached
+            if cached is not None and not cached.is_expired():
+                return cached
+            resolved = self._resolve()
+            self._cached = resolved
         _LOG.debug("bifrost: credential resolved from %s", resolved.source)
         return resolved
 

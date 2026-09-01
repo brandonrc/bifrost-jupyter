@@ -17,6 +17,12 @@ Two behaviours here exist because credentials expire:
   ``operator`` role, which a Nebari user only holds if their IdP group is mapped
   to it (see the README).
 
+Every call here is **synchronous and blocking** — the generated client is
+urllib3-based. Handlers must therefore never call these directly from tornado's
+IOLoop thread; :mod:`bifrost_jupyter.handlers` runs them in an executor. Every
+call is bounded by the shared client in :mod:`bifrost_jupyter._apiclient`, so a
+connected-but-silent server cannot pin a worker thread forever.
+
 Upstream ``ApiException``\\s are translated to :class:`BifrostAPIError`, which
 carries only the HTTP status and a fixed, safe message — never the upstream
 response body, which could echo internal detail or the token.
@@ -27,10 +33,11 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from bifrost_client import ApiClient, ApiException, ClustersApi, Configuration
+from bifrost_client import ApiException, ClustersApi, Configuration
 from bifrost_client.models.cluster_view import ClusterView
 from bifrost_client.models.create_cluster import CreateCluster
 
+from ._apiclient import DEFAULT_TIMEOUT_SECONDS, bounded_api_client
 from ._credentials import (
     BifrostConfigError,
     CredentialError,
@@ -80,6 +87,11 @@ _SAFE_MESSAGES = {
 }
 _DEFAULT_MESSAGE = "bifrost request failed"
 
+#: Re-exported so callers can name the budget; the value, and the reasoning for
+#: enforcing it at a chokepoint rather than per call site, live in
+#: :mod:`bifrost_jupyter._apiclient`.
+REQUEST_TIMEOUT_SECONDS = DEFAULT_TIMEOUT_SECONDS
+
 #: A 401 that survived a credential refresh. Says what to do, because the design
 #: is explicit that an expired credential must never reach the user as a mystery.
 _STALE_CREDENTIAL_MESSAGE = (
@@ -125,16 +137,24 @@ class BifrostClient:
     :class:`~bifrost_jupyter._credentials.StaticCredential`.
     """
 
-    def __init__(self, api_url: str, credentials: CredentialSource | str) -> None:
+    def __init__(
+        self,
+        api_url: str,
+        credentials: CredentialSource | str,
+        timeout: float = REQUEST_TIMEOUT_SECONDS,
+    ) -> None:
         source: CredentialSource = (
             StaticCredential(credentials) if isinstance(credentials, str) else credentials
         )
         self._credentials = source
+        self._timeout = timeout
         # The generated client reads ``access_token`` from this Configuration on
         # every request, so refreshing the credential is a field assignment —
         # no client rebuild, and calls already bound keep working.
         self._config = Configuration(host=api_url, access_token=source.get())
-        self._clusters = ClustersApi(ApiClient(self._config))
+        # Bounded at the chokepoint, so this and every future endpoint wrapper
+        # is timeout-safe without each call site remembering (see ._apiclient).
+        self._clusters = ClustersApi(bounded_api_client(self._config, timeout))
 
     def _refresh_credential(self) -> bool:
         """Re-resolve the credential. ``False`` if this source cannot refresh."""
@@ -157,6 +177,9 @@ class BifrostClient:
         """
         for attempt in (0, 1):
             try:
+                # No per-call timeout argument by design: the client this is
+                # bound to supplies one for every request (see ._apiclient), so a
+                # new endpoint wrapper cannot forget it.
                 return getattr(self._clusters, name)(*args)
             except ApiException as exc:
                 if exc.status == 401:

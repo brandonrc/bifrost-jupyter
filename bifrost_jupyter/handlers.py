@@ -21,14 +21,18 @@ routes included, since the id also lands in the Bifrost URL.
 
 from __future__ import annotations
 
+import functools
 import http.client
 import json
-from typing import Any
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, TypeVar
 from urllib.parse import quote
 
 import tornado
 from jupyter_server.base.handlers import APIHandler, JupyterHandler
 from jupyter_server.utils import url_path_join
+from tornado.ioloop import IOLoop
 
 from . import _address, _dashboard, _jobs, _profiles
 from .bifrost import BifrostAPIError, BifrostConfigError, client_from_env
@@ -70,18 +74,106 @@ class _ClusterIdMixin:
         return True
 
 
+_T = TypeVar("_T")
+
+#: Size of this extension's own thread pool.
+#:
+#: Small on purpose. The work is I/O-bound and already serialised twice over —
+#: credential resolution holds a lock, and everything downstream talks to one
+#: Bifrost — so more threads would buy queueing, not throughput. Four leaves
+#: room for a stalled call plus the panel's status poll and a user action.
+BLOCKING_POOL_SIZE = 4
+
+#: Prefix for the pool's thread names, so a stack dump or a `py-spy` attach says
+#: whose threads these are rather than showing anonymous workers.
+BLOCKING_POOL_PREFIX = "bifrost-jupyter"
+
+_EXECUTOR: ThreadPoolExecutor | None = None
+
+
+def blocking_executor() -> ThreadPoolExecutor:
+    """This extension's own bounded thread pool.
+
+    Deliberately **not** the default executor that ``run_in_executor(None, …)``
+    would use. That one is created per event loop and shared with the entire
+    jupyter-server process: every other extension, and jupyter-server's own
+    ``run_in_executor`` calls, draw from it. Filling it with our slow Bifrost
+    calls would starve them — which is the same harm Task 11 set out to fix,
+    moved one layer down from the IOLoop to the pool, and harder to see.
+
+    A cold-cache credential resolve can hold a thread for tens of seconds
+    (refresh, then exchange, then mint, each bounded), and the resolver's lock
+    serialises concurrent resolves, so a handful of simultaneous panel requests
+    genuinely can occupy several threads at once. Owning the pool keeps that
+    cost inside this extension.
+
+    **Saturation queues, it does not fail.** ``ThreadPoolExecutor``'s work queue
+    is unbounded, so when all four threads are busy further requests wait their
+    turn rather than being rejected. That is the right trade here — a queued
+    panel poll is a slow panel, a rejected one is an error in the user's face —
+    and it is bounded in practice because every outbound call carries a timeout
+    (``bifrost.REQUEST_TIMEOUT_SECONDS``), so a thread cannot be held forever.
+    The same bound caps how long interpreter shutdown can wait on these threads.
+
+    Created lazily and shared process-wide: one pool per server, not per handler
+    instance or per request.
+    """
+    global _EXECUTOR
+    if _EXECUTOR is None:
+        _EXECUTOR = ThreadPoolExecutor(
+            max_workers=BLOCKING_POOL_SIZE, thread_name_prefix=BLOCKING_POOL_PREFIX
+        )
+    return _EXECUTOR
+
+
 class _BifrostHandler(_ClusterIdMixin, APIHandler):
-    """Shared error handling for Bifrost-backed routes."""
+    """Shared error handling for Bifrost-backed routes.
+
+    Every Bifrost control-plane call this class makes is **blocking** — the
+    generated ``bifrost_client`` is urllib3-based, and since Task 9 constructing
+    a client can additionally perform an OIDC refresh, an RFC 8693 exchange and
+    a PAT mint. jupyter-server is single-threaded, so running any of that on the
+    IOLoop thread stalls the *entire* notebook server for its duration: kernel
+    WebSocket traffic, file saves, the file browser, every other extension. A
+    panel poll against a slow Bifrost would freeze the user's whole Lab session.
+
+    So the blocking work goes to a thread pool (:meth:`_blocking`) and the
+    handlers are ``async``. That is one half of the fix; the other is the
+    request timeout on every outbound call (:mod:`bifrost_jupyter._apiclient`),
+    without which a connected-but-silent server would pin a pool thread forever
+    and eventually starve the pool back into the same freeze.
+
+    The pool is this extension's own (:func:`blocking_executor`), not the
+    process-wide default, so a slow Bifrost cannot starve jupyter-server or
+    another extension either.
+    """
 
     def _fail(self, status: int, message: str) -> None:
         self.set_status(status)
         self.finish(json.dumps({"error": message}))
 
-    def _client(self):
-        # Raises BifrostConfigError if env is not configured; caught by callers.
-        return client_from_env()
+    async def _blocking(self, func: Callable[..., _T], *args: Any, **kwargs: Any) -> _T:
+        """Run ``func`` on this extension's own thread pool, awaiting the result.
 
-    def _write_client_or_fail(self, action: str):
+        The pool is ours, not the process-wide default — see
+        :func:`blocking_executor` for why that distinction matters.
+
+        Exceptions propagate to the caller as if it had been called inline, so
+        the ``BifrostAPIError``/``BifrostConfigError`` handling around each call
+        site is unchanged.
+        """
+        return await IOLoop.current().run_in_executor(
+            blocking_executor(), functools.partial(func, *args, **kwargs)
+        )
+
+    async def _client(self):
+        # Blocking: resolves the credential (possibly refresh + exchange + mint)
+        # and builds the client. Raises BifrostConfigError when the extension is
+        # not configured, BifrostAPIError when a credential cannot be made
+        # usable; both are caught by callers.
+        return await self._blocking(client_from_env)
+
+    async def _write_client_or_fail(self, action: str):
         """Return a configured client, or answer a clean 409 and return ``None``.
 
         A lifecycle action (stop/suspend/resume) is a deliberate user action, so —
@@ -96,7 +188,7 @@ class _BifrostHandler(_ClusterIdMixin, APIHandler):
         "not configured".
         """
         try:
-            return self._client()
+            return await self._client()
         except BifrostConfigError:
             self.log.warning("bifrost: %s requested but extension is not configured", action)
             self._fail(409, "bifrost not configured")
@@ -120,6 +212,12 @@ class ProfilesHandler(_BifrostHandler):
         self.finish(json.dumps({"profiles": [v.to_dict() for v in views]}))
 
 
+def _create_and_read(client, body):
+    """Create a cluster and read it back — one unit of blocking work."""
+    client.create_cluster(body)
+    return client.get_cluster(body.id)
+
+
 def _observed_state(view) -> str:
     """The coarse, safe state for a cluster view: observed, else desired."""
     return view.observed_state or view.desired or "pending"
@@ -134,9 +232,9 @@ class ClustersHandler(_BifrostHandler):
     """
 
     @tornado.web.authenticated
-    def get(self) -> None:
+    async def get(self) -> None:
         try:
-            client = self._client()
+            client = await self._client()
         except BifrostConfigError:
             # "Never configured" is a normal, expected state for a bare install,
             # not an error. This route is polled on page load, so returning a
@@ -154,7 +252,7 @@ class ClustersHandler(_BifrostHandler):
             return
 
         try:
-            views = client.list_clusters()
+            views = await self._blocking(client.list_clusters)
         except BifrostAPIError as exc:
             self._fail(exc.status, exc.message)
             return
@@ -163,11 +261,11 @@ class ClustersHandler(_BifrostHandler):
         self.finish(json.dumps({"clusters": clusters, "configured": True}))
 
     @tornado.web.authenticated
-    def post(self) -> None:
+    async def post(self) -> None:
         # A start is a deliberate user action, not a page-load poll, so an
         # unconfigured extension is a clean 4xx (logged at warning, not error),
         # and a credential problem is relayed with its actionable message.
-        client = self._write_client_or_fail("start")
+        client = await self._write_client_or_fail("start")
         if client is None:
             return
 
@@ -197,8 +295,9 @@ class ClustersHandler(_BifrostHandler):
             return
 
         try:
-            client.create_cluster(body)
-            view = client.get_cluster(body.id)
+            # Two round trips, both blocking; one hop to the pool covers both so
+            # the create and its status read are not split across threads.
+            view = await self._blocking(_create_and_read, client, body)
         except BifrostAPIError as exc:
             self._fail(exc.status, exc.message)
             return
@@ -239,14 +338,14 @@ class ClusterHandler(_BifrostHandler):
     """
 
     @tornado.web.authenticated
-    def delete(self, cluster_id: str) -> None:
+    async def delete(self, cluster_id: str) -> None:
         if not self._check_cluster_id(cluster_id):
             return
-        client = self._write_client_or_fail("stop")
+        client = await self._write_client_or_fail("stop")
         if client is None:
             return
         try:
-            client.delete_cluster(cluster_id)
+            await self._blocking(client.delete_cluster, cluster_id)
         except BifrostAPIError as exc:
             self._fail(exc.status, exc.message)
             return
@@ -266,15 +365,15 @@ class ClusterLifecycleHandler(_BifrostHandler):
     _TRANSITIONS = {"suspend": "suspending", "resume": "resuming"}
 
     @tornado.web.authenticated
-    def post(self, cluster_id: str, action: str) -> None:
+    async def post(self, cluster_id: str, action: str) -> None:
         if not self._check_cluster_id(cluster_id):
             return
-        client = self._write_client_or_fail(action)
+        client = await self._write_client_or_fail(action)
         if client is None:
             return
         op = client.suspend_cluster if action == "suspend" else client.resume_cluster
         try:
-            op(cluster_id)
+            await self._blocking(op, cluster_id)
         except BifrostAPIError as exc:
             self._fail(exc.status, exc.message)
             return

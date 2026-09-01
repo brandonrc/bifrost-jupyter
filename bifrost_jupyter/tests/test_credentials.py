@@ -8,9 +8,12 @@ escapes into a message, a log line or a repr.
 from __future__ import annotations
 
 import base64
+import copy
 import dataclasses
 import json
 import logging
+import pickle
+import threading
 import time
 import urllib.error
 from types import SimpleNamespace
@@ -19,6 +22,7 @@ import pytest
 from bifrost_client import ApiException
 
 from bifrost_jupyter import _credentials
+from bifrost_jupyter._apiclient import BoundedApiClient
 
 API_URL = "https://bifrost.example"
 TOKEN_URL = "https://keycloak.example/realms/nebari/protocol/openid-connect/token"
@@ -81,16 +85,19 @@ def fake_auth_api(monkeypatch):
 
     class FakeAuthApi:
         def __init__(self, api_client):
+            self._api_client = api_client
             self._bearer = api_client.configuration.access_token
             self._host = api_client.configuration.host
 
-        def create_token(self, request):
+        def create_token(self, request, **kwargs):
             state.calls.append(
                 SimpleNamespace(
                     bearer=self._bearer,
                     host=self._host,
                     label=request.label,
                     expires_in_days=request.expires_in_days,
+                    api_client=self._api_client,
+                    timeout=kwargs.get("_request_timeout"),
                 )
             )
             if state.error is not None:
@@ -474,3 +481,116 @@ def test_session_resolver_resolves_once_per_session(monkeypatch, fake_auth_api):
     for _ in range(5):
         assert resolver.get() == "mob_minted"
     assert len(fake_auth_api.calls) == 1
+
+
+# --- the mint is bounded too (Task 11) -------------------------------------
+
+
+def test_the_pat_mint_is_bounded(monkeypatch, fake_auth_api):
+    """The mint runs on a worker thread during session start. Unbounded, a
+    connected-but-silent Bifrost would pin that thread for the life of the
+    server.
+
+    Asserted at the client, not at the call: the bound comes from the shared
+    chokepoint, so it holds for any endpoint this module calls later without
+    that call site having to remember.
+    """
+    monkeypatch.setenv(_credentials.OIDC_TOKEN_ENV_VAR, make_jwt(time.time() + 3600))
+    monkeypatch.setenv(_credentials.MINT_PAT_ENV_VAR, "1")
+
+    _credentials.CredentialResolver(API_URL).credential()
+
+    (call,) = fake_auth_api.calls
+    assert isinstance(call.api_client, BoundedApiClient)
+    assert call.api_client.default_timeout == _credentials._HTTP_TIMEOUT_SECS
+    # And the mint itself passes no per-call argument — it does not need to.
+    assert call.timeout is None
+
+
+# --- resolution is now concurrent, so it must be locked (Task 11) ----------
+
+
+def test_concurrent_resolution_resolves_once(monkeypatch):
+    """The handlers moved their blocking work to a thread pool, so two panel
+    requests can resolve a cold credential on two threads at the same time.
+    Without a lock each would run the exchange and mint the session PAT."""
+    monkeypatch.setenv(_credentials.OIDC_TOKEN_ENV_VAR, make_jwt(time.time() + 3600))
+    monkeypatch.setenv(_credentials.MINT_PAT_ENV_VAR, "1")
+
+    threads = 6
+    start = threading.Barrier(threads)
+    resolver = _credentials.CredentialResolver(API_URL)
+    results: list[str] = []
+    errors: list[BaseException] = []
+
+    mints: list[float] = []
+
+    class SlowMintApi:
+        def __init__(self, api_client):
+            self._bearer = api_client.configuration.access_token
+
+        def create_token(self, request, **kwargs):
+            # Widen the window a real network mint would have.
+            mints.append(time.monotonic())
+            time.sleep(0.05)
+            return SimpleNamespace(
+                token="mob_minted", prefix="mob_min", expires_at=time.time() + 86_400
+            )
+
+    monkeypatch.setattr(_credentials, "AuthApi", SlowMintApi)
+
+    def resolve():
+        try:
+            start.wait(timeout=5)
+            results.append(resolver.get())
+        except BaseException as exc:  # noqa: BLE001 - surfaced by the assertion below
+            errors.append(exc)
+
+    workers = [threading.Thread(target=resolve) for _ in range(threads)]
+    for w in workers:
+        w.start()
+    for w in workers:
+        w.join(timeout=10)
+
+    assert not errors, errors
+    assert results == ["mob_minted"] * threads
+    assert len(mints) == 1, f"{len(mints)} concurrent mints — the resolver is not locked"
+
+
+# --- pickle and copy also leak a token, and __slots__ does not stop them ----
+
+
+@pytest.mark.parametrize(
+    "make",
+    [
+        lambda: _credentials.Credential("mob_supersecret", "dev-pat", None),
+        lambda: _credentials.StaticCredential("mob_supersecret"),
+    ],
+    ids=["Credential", "StaticCredential"],
+)
+def test_credentials_refuse_pickle_and_copy(make):
+    """``__slots__`` blocks ``vars``/``asdict`` and does **nothing** here: the
+    default slot-based ``__reduce_ex__`` serialises the slot values happily, so
+    ``pickle.dumps`` produced bytes containing the plaintext token and
+    ``copy``/``deepcopy`` produced working duplicates of it."""
+    credential = make()
+
+    with pytest.raises(TypeError):
+        pickle.dumps(credential)
+    with pytest.raises(TypeError):
+        copy.copy(credential)
+    with pytest.raises(TypeError):
+        copy.deepcopy(credential)
+    with pytest.raises(TypeError):
+        credential.__reduce__()
+
+    # The deliberate way out still works.
+    assert credential.get() if hasattr(credential, "get") else credential.token
+
+
+def test_pickling_a_container_holding_a_credential_also_fails():
+    """The realistic shape of the leak: nobody pickles a Credential directly,
+    they pickle a dict or a cache that happens to hold one."""
+    payload = {"session": {"credential": _credentials.Credential("mob_supersecret", "oidc", None)}}
+    with pytest.raises(TypeError):
+        pickle.dumps(payload)

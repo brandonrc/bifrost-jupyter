@@ -9,8 +9,11 @@ body. The jobs routes talk to the cluster's Ray head service instead of Bifrost,
 so there it is tornado's ``AsyncHTTPClient`` that is faked.
 """
 
+import asyncio
+import concurrent.futures
 import io
 import json
+import threading
 import time
 from types import SimpleNamespace
 
@@ -766,7 +769,7 @@ async def test_oidc_credential_never_reaches_the_browser(jp_fetch, monkeypatch):
 
     seen = {}
 
-    def fake_list(self):
+    def fake_list(self, **_kwargs):
         seen["bearer"] = self.api_client.configuration.auth_settings()["bearer"]["value"]
         return []
 
@@ -782,3 +785,199 @@ async def test_oidc_credential_never_reaches_the_browser(jp_fetch, monkeypatch):
     body = resp.body.decode()
     assert oidc not in body
     assert TOKEN not in body
+
+
+# --- the IOLoop must stay responsive while Bifrost is slow (Task 11) --------
+#
+# jupyter-server is single-threaded. A blocking control-plane call made on the
+# IOLoop thread stalls the WHOLE notebook server for its duration — kernel
+# WebSocket traffic, file saves, the file browser, every other extension — so a
+# panel poll against a slow Bifrost would freeze the user's entire Lab session.
+# These assert the loop keeps serving while a Bifrost call is in flight.
+
+#: Long enough that "the loop was blocked" and "the loop was free" cannot be
+#: confused, short enough not to dominate the suite.
+SLOW_CALL_SECONDS = 1.0
+
+
+class SlowClient:
+    """A Bifrost client whose calls block the calling thread, like a slow server."""
+
+    def __init__(self, entered):
+        self._entered = entered
+
+    def list_clusters(self):
+        self._entered.set()
+        time.sleep(SLOW_CALL_SECONDS)
+        return []
+
+    def create_cluster(self, body):
+        self._entered.set()
+        time.sleep(SLOW_CALL_SECONDS)
+
+    def get_cluster(self, cluster_id):
+        return SimpleNamespace(observed_state="running", desired="running")
+
+    def delete_cluster(self, cluster_id):
+        self._entered.set()
+        time.sleep(SLOW_CALL_SECONDS)
+
+    def suspend_cluster(self, cluster_id):
+        self._entered.set()
+        time.sleep(SLOW_CALL_SECONDS)
+
+    resume_cluster = suspend_cluster
+
+
+async def _assert_loop_stays_responsive(jp_fetch, monkeypatch, slow_request):
+    """Run ``slow_request`` and race a trivial request against it.
+
+    The trivial request is issued only once the blocking call has actually
+    started, and must finish first. If the blocking work runs on the IOLoop
+    thread it cannot: the fast request is not even parsed until the slow one is
+    done, so the completion order inverts and this fails (rather than hanging —
+    the block is bounded).
+    """
+    entered = threading.Event()
+    monkeypatch.setattr(handlers, "client_from_env", lambda: SlowClient(entered))
+    order = []
+
+    async def slow():
+        await slow_request()
+        order.append("slow")
+
+    async def fast():
+        while not entered.is_set():
+            await asyncio.sleep(0.01)
+        await jp_fetch("bifrost", "profiles")
+        order.append("fast")
+
+    await asyncio.gather(slow(), fast())
+    assert order == ["fast", "slow"], (
+        "the trivial request finished only after the slow Bifrost call — "
+        "the IOLoop was blocked, so the whole notebook server was frozen"
+    )
+
+
+async def test_slow_list_does_not_block_the_loop(jp_fetch, monkeypatch):
+    await _assert_loop_stays_responsive(
+        jp_fetch, monkeypatch, lambda: jp_fetch("bifrost", "clusters")
+    )
+
+
+async def test_slow_start_does_not_block_the_loop(jp_fetch, monkeypatch):
+    await _assert_loop_stays_responsive(
+        jp_fetch,
+        monkeypatch,
+        lambda: jp_fetch("bifrost", "clusters", method="POST", body='{"profile": "small"}'),
+    )
+
+
+async def test_slow_stop_does_not_block_the_loop(jp_fetch, monkeypatch):
+    await _assert_loop_stays_responsive(
+        jp_fetch,
+        monkeypatch,
+        lambda: jp_fetch("bifrost", "clusters", "jl-small-0123456789ab", method="DELETE"),
+    )
+
+
+async def test_slow_suspend_does_not_block_the_loop(jp_fetch, monkeypatch):
+    await _assert_loop_stays_responsive(
+        jp_fetch,
+        monkeypatch,
+        lambda: jp_fetch(
+            "bifrost", "clusters", "jl-small-0123456789ab", "suspend", method="POST", body=""
+        ),
+    )
+
+
+async def test_slow_credential_resolution_does_not_block_the_loop(jp_fetch, monkeypatch):
+    """Since Task 9 the *client construction* can do network I/O too — an OIDC
+    refresh, an RFC 8693 exchange and a PAT mint, each with its own timeout. That
+    path has to be off the loop as well, not just the Bifrost call after it."""
+    entered = threading.Event()
+
+    def slow_client_from_env():
+        entered.set()
+        time.sleep(SLOW_CALL_SECONDS)
+        return FakeClient(clusters=[])
+
+    monkeypatch.setattr(handlers, "client_from_env", slow_client_from_env)
+    order = []
+
+    async def slow():
+        await jp_fetch("bifrost", "clusters")
+        order.append("slow")
+
+    async def fast():
+        while not entered.is_set():
+            await asyncio.sleep(0.01)
+        await jp_fetch("bifrost", "profiles")
+        order.append("fast")
+
+    await asyncio.gather(slow(), fast())
+    assert order == ["fast", "slow"]
+
+
+# --- the blocking work runs on OUR pool, not the process-wide one ----------
+#
+# `run_in_executor(None, ...)` uses the default executor, which is per-event-loop
+# and shared with all of jupyter-server: every other extension, and the server's
+# own run_in_executor calls, draw from it. Filling it with slow Bifrost calls
+# would starve them — the Task 11 harm moved one layer down, from the IOLoop to
+# the pool, and harder to spot. So the extension owns a bounded, named pool.
+
+
+async def test_blocking_work_runs_on_the_extensions_own_pool(jp_fetch, monkeypatch):
+    """Identified by thread name, which is also what makes the pool legible in a
+    stack dump or a `py-spy` attach."""
+    seen = {}
+
+    class ThreadNamingClient(FakeClient):
+        def list_clusters(self):
+            seen["thread"] = threading.current_thread().name
+            return []
+
+    monkeypatch.setattr(handlers, "client_from_env", lambda: ThreadNamingClient())
+
+    await jp_fetch("bifrost", "clusters")
+
+    assert seen["thread"].startswith(handlers.BLOCKING_POOL_PREFIX), (
+        f"blocking work ran on {seen['thread']!r} — that is the process-wide "
+        "default pool, shared with jupyter-server and every other extension"
+    )
+
+
+def test_the_pool_is_bounded_and_named():
+    executor = handlers.blocking_executor()
+    assert executor._max_workers == handlers.BLOCKING_POOL_SIZE
+    assert executor is handlers.blocking_executor(), "the pool must be shared, not per-call"
+
+
+async def test_the_pool_is_not_the_event_loops_default(jp_fetch, monkeypatch):
+    """The distinction the fix turns on: had `_blocking` passed ``None``, the work
+    would land on the loop's default executor instead."""
+    loop = asyncio.get_running_loop()
+    submitted = []
+
+    class RecordingDefault(concurrent.futures.ThreadPoolExecutor):
+        def submit(self, fn, /, *args, **kwargs):
+            # ``_blocking`` submits a functools.partial; unwrap to the real target.
+            submitted.append(getattr(fn, "func", fn))
+            return super().submit(fn, *args, **kwargs)
+
+    loop.set_default_executor(RecordingDefault(max_workers=2))
+    client = FakeClient(clusters=[])
+    monkeypatch.setattr(handlers, "client_from_env", lambda: client)
+
+    await jp_fetch("bifrost", "clusters")
+
+    # asyncio itself legitimately uses the default pool (getaddrinfo for the test
+    # client's own connection), so assert about *our* work specifically.
+    ours = {handlers.client_from_env, client.list_clusters}
+    leaked = [fn for fn in submitted if fn in ours]
+    assert not leaked, (
+        f"{leaked} ran on the loop's default executor — that pool belongs to the "
+        "whole jupyter-server process, not to this extension"
+    )
+    assert submitted, "the recording executor was never consulted; the test proves nothing"
