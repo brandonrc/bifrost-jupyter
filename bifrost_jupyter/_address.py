@@ -6,7 +6,7 @@ the cluster's namespace, and Bifrost uses the cluster id as the RayCluster name
 (``CreateCluster.id`` doc), so a per-owner notebook pod reaches its cluster
 directly at::
 
-    http://<id>-head-svc.<namespace>.svc:8265      # Ray Jobs API
+    http://<id>-head-svc.<namespace>.svc:8265      # Ray Jobs API *and* dashboard
     ray://<id>-head-svc.<namespace>.svc:10001       # Ray Client (advanced)
 
 The tier-2 per-owner NetworkPolicy (kuberay.go) admits the owner's notebook pod
@@ -33,6 +33,21 @@ def head_service_host(cluster_id: str, namespace: str) -> str:
 def jobs_address(cluster_id: str, namespace: str) -> str:
     """The Ray Jobs API address (``http://...:8265``) for ``JobSubmissionClient``."""
     return f"http://{head_service_host(cluster_id, namespace)}:{JOBS_PORT}"
+
+
+def dashboard_address(cluster_id: str, namespace: str) -> str:
+    """The Ray **dashboard** origin for a cluster.
+
+    Ray serves the dashboard single-page app and the Jobs REST API from the same
+    aiohttp server on the same port (:8265) — the dashboard UI is at ``/`` and
+    the Jobs API under ``/api/jobs/``. So this is deliberately the same string as
+    :func:`jobs_address`; it exists as its own name because the two are separate
+    *concerns* (observability vs. job submission) even though they share a port,
+    and a reader of ``handlers.py`` should not have to know that coincidence.
+
+    Returned with no trailing slash: the dashboard proxy appends the sub-path.
+    """
+    return jobs_address(cluster_id, namespace)
 
 
 def ray_client_address(cluster_id: str, namespace: str) -> str:

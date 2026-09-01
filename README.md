@@ -47,6 +47,44 @@ REST contract is spoken directly over HTTP. Ray stays the optional
 `bifrost-jupyter[kernel]` extra, used only by the kernel-side `connect()`
 helper.
 
+## Viewing the Ray dashboard
+
+Each running cluster gets a **Dashboard** button in the panel. It opens the
+cluster's Ray dashboard in a JupyterLab tab, served **same-origin** by this
+extension:
+
+```
+GET /bifrost/clusters/{id}/dashboard/         -> http://<id>-head-svc.<ns>.svc:8265/
+GET /bifrost/clusters/{id}/dashboard/<path>   -> the same, sub-path and query preserved
+GET /bifrost/clusters/{id}/dashboard          -> 302 to the trailing-slash form
+```
+
+Ray serves the dashboard on the _same_ port as the Jobs API (`:8265`), so this
+reuses the same in-cluster address derivation and the same authorization story
+as job submission: **no Bifrost bearer token is sent on this path**, because the
+per-owner NetworkPolicy is what admits the notebook pod to the head service.
+Nothing from the browser is forwarded upstream either — in particular Jupyter's
+own session cookie never reaches the Ray head — and only an allowlist of
+response headers comes back.
+
+Notes and deliberate limits:
+
+- **Read-only.** Only `GET`/`HEAD` are proxied; any write verb gets a 405. Ray's
+  dashboard has _write_ access to the cluster, and proxying writes would mean
+  exempting the route from Jupyter's XSRF check, turning this into a CSRF path
+  into the cluster. Use the panel's own job routes to act on a cluster.
+- **Trailing slash matters.** Ray's dashboard resolves its assets and API calls
+  relative to the document URL (it is built with `PUBLIC_URL="."` and routes with
+  a `HashRouter`), which is why the mount point ends in `/` and the slash-less
+  form redirects. Because of this, no asset-path rewriting is needed and
+  `jupyter-server-proxy` is **not** a dependency.
+- **State-gated.** The button appears only for `running` clusters. A stopped,
+  suspended or still-starting cluster has no head service to reach, and the route
+  answers a clean `502 ray cluster unreachable` rather than failing loudly.
+- **In-cluster only.** Like the jobs path, this works from a notebook running in
+  the cluster (the Nebari target). Remote/off-cluster dashboard access is
+  deferred with the rest of the remote-access story.
+
 ## Requirements
 
 - JupyterLab >= 4.0.0

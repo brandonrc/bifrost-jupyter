@@ -39,6 +39,9 @@ const resumeCluster = api.resumeCluster as jest.MockedFunction<
   typeof api.resumeCluster
 >;
 const getAddress = api.getAddress as jest.MockedFunction<typeof api.getAddress>;
+const dashboardUrl = api.dashboardUrl as jest.MockedFunction<
+  typeof api.dashboardUrl
+>;
 const submitJob = api.submitJob as jest.MockedFunction<typeof api.submitJob>;
 const getJobStatus = api.getJobStatus as jest.MockedFunction<
   typeof api.getJobStatus
@@ -87,6 +90,10 @@ describe('BifrostPanel', () => {
     suspendCluster.mockReset();
     resumeCluster.mockReset();
     getAddress.mockReset();
+    dashboardUrl.mockReset();
+    dashboardUrl.mockImplementation(
+      (_settings, id) => `https://x.test/bifrost/clusters/${id}/dashboard/`
+    );
     submitJob.mockReset();
     getJobStatus.mockReset();
     insertBelow.mockReset();
@@ -237,12 +244,16 @@ describe('BifrostPanel', () => {
     expect(createCluster).toHaveBeenCalledWith(expect.anything(), 'small');
   });
 
-  async function attachedWith(clusterState: string, notebooks?: any) {
+  async function attachedWith(
+    clusterState: string,
+    notebooks?: any,
+    openDashboard?: (args: { id: string; url: string }) => void
+  ) {
     listClusters.mockResolvedValue({
       clusters: [{ id: 'jl-run-aaa', state: clusterState }],
       configured: true
     });
-    panel = new BifrostPanel(settings(), notebooks);
+    panel = new BifrostPanel(settings(), notebooks, undefined, openDashboard);
     Widget.attach(panel, document.body);
     await flush();
   }
@@ -251,10 +262,11 @@ describe('BifrostPanel', () => {
     return panel.node.querySelector(cls) as HTMLButtonElement | null;
   }
 
-  it('shows Connect, Run job, Suspend and Stop for a running cluster (no Resume)', async () => {
+  it('shows Connect, Dashboard, Run job, Suspend and Stop for a running cluster (no Resume)', async () => {
     await attachedWith('running');
     expect(actionButton('.jp-BifrostPanel-runJob')).not.toBeNull();
     expect(actionButton('.jp-BifrostPanel-connect')).not.toBeNull();
+    expect(actionButton('.jp-BifrostPanel-dashboard')).not.toBeNull();
     expect(actionButton('.jp-BifrostPanel-suspend')).not.toBeNull();
     expect(actionButton('.jp-BifrostPanel-stop')).not.toBeNull();
     expect(actionButton('.jp-BifrostPanel-resume')).toBeNull();
@@ -267,12 +279,15 @@ describe('BifrostPanel', () => {
     expect(actionButton('.jp-BifrostPanel-suspend')).toBeNull();
     expect(actionButton('.jp-BifrostPanel-connect')).toBeNull();
     expect(actionButton('.jp-BifrostPanel-runJob')).toBeNull();
+    // No head service to proxy to while suspended — the route would 502.
+    expect(actionButton('.jp-BifrostPanel-dashboard')).toBeNull();
   });
 
   it('shows only Stop for a pending cluster', async () => {
     await attachedWith('pending');
     expect(actionButton('.jp-BifrostPanel-stop')).not.toBeNull();
     expect(actionButton('.jp-BifrostPanel-connect')).toBeNull();
+    expect(actionButton('.jp-BifrostPanel-dashboard')).toBeNull();
     expect(actionButton('.jp-BifrostPanel-runJob')).toBeNull();
     expect(actionButton('.jp-BifrostPanel-suspend')).toBeNull();
     expect(actionButton('.jp-BifrostPanel-resume')).toBeNull();
@@ -580,5 +595,89 @@ describe('BifrostPanel', () => {
     expect(
       panel.node.querySelector('.jp-BifrostPanel-jobTarget')?.textContent
     ).toContain('Run job');
+  });
+});
+
+describe('BifrostPanel dashboard action', () => {
+  let panel: BifrostPanel;
+
+  beforeEach(() => {
+    listProfiles.mockReset();
+    listProfiles.mockResolvedValue([]);
+    listClusters.mockReset();
+    listClusters.mockResolvedValue({
+      clusters: [{ id: 'jl-run-aaa', state: 'running' }],
+      configured: true
+    });
+    dashboardUrl.mockReset();
+    dashboardUrl.mockImplementation(
+      (_settings, id) => `https://x.test/bifrost/clusters/${id}/dashboard/`
+    );
+  });
+
+  afterEach(() => {
+    panel?.dispose();
+  });
+
+  async function attach(
+    openDashboard?: (args: { id: string; url: string }) => void
+  ) {
+    panel = new BifrostPanel(settings(), undefined, undefined, openDashboard);
+    Widget.attach(panel, document.body);
+    await flush();
+  }
+
+  it('hands the same-origin proxied URL to the in-Lab opener', async () => {
+    const openDashboard = jest.fn();
+    await attach(openDashboard);
+
+    panel.node
+      .querySelector<HTMLButtonElement>('.jp-BifrostPanel-dashboard')!
+      .click();
+
+    expect(dashboardUrl).toHaveBeenCalledWith(expect.anything(), 'jl-run-aaa');
+    expect(openDashboard).toHaveBeenCalledWith({
+      id: 'jl-run-aaa',
+      url: 'https://x.test/bifrost/clusters/jl-run-aaa/dashboard/'
+    });
+
+    // The invariant a reviewer greps for: the browser is pointed at the user's
+    // own Jupyter server, never at the cluster's head service, and no token.
+    const { url } = openDashboard.mock.calls[0][0];
+    expect(url.startsWith('https://x.test/bifrost/')).toBe(true);
+    expect(url).not.toContain('8265');
+    expect(url).not.toContain('head-svc');
+    expect(url).not.toContain('token');
+  });
+
+  it('makes no network call to open the dashboard', async () => {
+    const openDashboard = jest.fn();
+    await attach(openDashboard);
+
+    const before = listClusters.mock.calls.length;
+    panel.node
+      .querySelector<HTMLButtonElement>('.jp-BifrostPanel-dashboard')!
+      .click();
+
+    expect(listClusters.mock.calls.length).toBe(before);
+    expect(getAddress).not.toHaveBeenCalled();
+  });
+
+  it('falls back to a new browser tab when no in-Lab opener is wired up', async () => {
+    const open = jest
+      .spyOn(window, 'open')
+      .mockReturnValue(null as unknown as Window);
+    await attach();
+
+    panel.node
+      .querySelector<HTMLButtonElement>('.jp-BifrostPanel-dashboard')!
+      .click();
+
+    expect(open).toHaveBeenCalledWith(
+      'https://x.test/bifrost/clusters/jl-run-aaa/dashboard/',
+      '_blank',
+      'noopener,noreferrer'
+    );
+    open.mockRestore();
   });
 });

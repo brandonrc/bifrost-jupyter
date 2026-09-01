@@ -35,3 +35,16 @@ def test_connect_snippet_offers_ray_client_as_commented_alternative():
             assert line.lstrip().startswith("#"), f"Ray Client line must be commented: {line!r}"
     # Still runnable: the commented lines don't break compilation.
     compile(snippet, "<snippet>", "exec")
+
+
+def test_dashboard_address_shares_the_jobs_port():
+    # Ray serves the dashboard SPA and the Jobs REST API from one server on 8265.
+    assert (
+        _address.dashboard_address("cl-1", "bifrost") == "http://cl-1-head-svc.bifrost.svc:8265"
+    )
+    assert _address.dashboard_address("cl-1", "bifrost") == _address.jobs_address("cl-1", "bifrost")
+
+
+def test_dashboard_address_has_no_trailing_slash():
+    # The proxy appends the sub-path itself; a trailing slash here would double up.
+    assert not _address.dashboard_address("cl-1", "team-x").endswith("/")
