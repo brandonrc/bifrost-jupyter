@@ -13,7 +13,9 @@ credential server-side and forwards it to Bifrost as a bearer token (Bifrost
 emits no CORS headers, so a browser-only extension cannot call it directly). The
 TS labextension talks only to its co-located server routes under `/bifrost/*`.
 A kernel-side helper (`from bifrost_jupyter import connect`) returns a
-preconfigured Ray `JobSubmissionClient` pointed at the Bifrost gateway.
+preconfigured Ray `JobSubmissionClient` pointed at the cluster's **in-cluster
+head service** (`http://<id>-head-svc.<namespace>.svc:8265`) — not a Bifrost
+gateway host, per the design §2 amendment.
 
 > **Status:** scaffold only. This repo currently contains the
 > `frontend-and-server` extension skeleton with dependencies, CI, and packaging
@@ -38,14 +40,65 @@ The server extension forwards this to the cluster's own Ray Jobs REST API
 under `runtime_env.env_vars`, and returns the Ray submission id.
 
 Note this path does **not** go through Bifrost and carries **no bearer token**.
-The jupyter-server extension runs inside the user's notebook pod, which carries
-the `bifrost.dev/owner` label, so the per-owner NetworkPolicy admits it to the
-head service on `:8265` — reachability is the authorization. The Bifrost
-credential stays on the control-plane routes (start/list/stop/suspend/resume).
+Two things stand in for one. The jupyter-server extension runs inside the user's
+notebook pod, which carries the `bifrost.dev/owner` label, so the per-owner
+NetworkPolicy admits it to the head service on `:8265`; **and** the cluster id is
+validated to a single DNS label before it is interpolated into that host, which
+pins the target to a head service in the configured namespace. Reachability alone
+would not be authorization — the id is a path segment the caller controls, so an
+unvalidated one would let the caller choose the host the _server_ connects to.
+Every `/bifrost/clusters/{id}/...` route rejects a malformed id with a clean
+`400 invalid cluster id` before making any upstream call. The Bifrost credential
+stays on the control-plane routes (start/list/stop/suspend/resume).
 Ray itself is **not** installed in the server environment for this: the Jobs
 REST contract is spoken directly over HTTP. Ray stays the optional
 `bifrost-jupyter[kernel]` extra, used only by the kernel-side `connect()`
 helper.
+
+## Viewing the Ray dashboard
+
+Each running cluster gets a **Dashboard** button in the panel. It opens the
+cluster's Ray dashboard in a JupyterLab tab, served **same-origin** by this
+extension:
+
+```
+GET /bifrost/clusters/{id}/dashboard/         -> http://<id>-head-svc.<ns>.svc:8265/
+GET /bifrost/clusters/{id}/dashboard/<path>   -> the same, sub-path and query preserved
+GET /bifrost/clusters/{id}/dashboard          -> 302 to the trailing-slash form
+```
+
+Ray serves the dashboard on the _same_ port as the Jobs API (`:8265`), so this
+reuses the same in-cluster address derivation and the same authorization story
+as job submission: **no Bifrost bearer token is sent on this path** — the gate is
+the per-owner NetworkPolicy that admits the notebook pod to the head service,
+plus the validated cluster id that pins the target (see the note above). Nothing
+from the browser is forwarded upstream either — in particular Jupyter's own
+session cookie never reaches the Ray head — and only an allowlist of response
+headers comes back.
+
+Notes and deliberate limits:
+
+- **Read-only.** Only `GET`/`HEAD` are proxied; any write verb gets a 405. Ray's
+  dashboard has _write_ access to the cluster, and proxying writes would mean
+  exempting the route from Jupyter's XSRF check, turning this into a CSRF path
+  into the cluster. Use the panel's own job routes to act on a cluster.
+- **Trailing slash matters.** Ray's dashboard resolves its assets and API calls
+  relative to the document URL (it is built with `PUBLIC_URL="."` and routes with
+  a `HashRouter`), which is why the mount point ends in `/` and the slash-less
+  form redirects. Because of this, no asset-path rewriting is needed and
+  `jupyter-server-proxy` is **not** a dependency.
+- **Validated id.** A cluster id must be a single RFC 1123 DNS label
+  (`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`), which is what the extension generates
+  (`jl-<slug>-<12 hex>`). Anything else — a `:`, `?`, `#`, `@`, `%`, `/`, a dot,
+  whitespace, uppercase, or over 63 characters — is a `400` before any connection
+  is opened. Without this, an id could restructure the derived URL and choose the
+  host the server connects to.
+- **State-gated.** The button appears only for `running` clusters. A stopped,
+  suspended or still-starting cluster has no head service to reach, and the route
+  answers a clean `502 ray cluster unreachable` rather than failing loudly.
+- **In-cluster only.** Like the jobs path, this works from a notebook running in
+  the cluster (the Nebari target). Remote/off-cluster dashboard access is
+  deferred with the rest of the remote-access story.
 
 ## Requirements
 

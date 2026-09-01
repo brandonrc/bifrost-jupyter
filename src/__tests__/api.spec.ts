@@ -2,6 +2,7 @@ import { ServerConnection } from '@jupyterlab/services';
 
 import {
   createCluster,
+  dashboardUrl,
   getAddress,
   getJobStatus,
   listClusters,
@@ -309,6 +310,37 @@ describe('api response typing', () => {
     const response = await listClusters(makeSettings());
     expect(response.clusters).toEqual([]);
     expect(response.configured).toBe(false);
+    spy.mockRestore();
+  });
+});
+
+describe('dashboardUrl', () => {
+  it('builds a same-origin, tokenless URL with the required trailing slash', () => {
+    const url = dashboardUrl(makeSettings(), 'jl-small-abc');
+
+    // Same-origin by construction: rooted at baseUrl, never the head service.
+    expect(url).toBe(`${BASE_URL}bifrost/clusters/jl-small-abc/dashboard/`);
+    expect(url).not.toContain('8265');
+    expect(url).not.toContain('head-svc');
+    expect(url).not.toContain('token');
+  });
+
+  it('keeps the trailing slash Ray needs to resolve its relative assets', () => {
+    // Without it the browser resolves ./static/... one segment too high and the
+    // dashboard loads blank; Ray's reverse-proxy docs call this out explicitly.
+    expect(dashboardUrl(makeSettings(), 'jl-x')).toMatch(/\/dashboard\/$/);
+  });
+
+  it('encodes the cluster id', () => {
+    expect(dashboardUrl(makeSettings(), 'a/b')).toBe(
+      `${BASE_URL}bifrost/clusters/a%2Fb/dashboard/`
+    );
+  });
+
+  it('issues no request — it is a URL builder', () => {
+    const spy = jest.spyOn(ServerConnection, 'makeRequest');
+    dashboardUrl(makeSettings(), 'jl-x');
+    expect(spy).not.toHaveBeenCalled();
     spy.mockRestore();
   });
 });

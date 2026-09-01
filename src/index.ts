@@ -5,9 +5,17 @@ import {
 
 import { INotebookTracker } from '@jupyterlab/notebook';
 
-import { ITranslator } from '@jupyterlab/translation';
+import {
+  ITranslator,
+  nullTranslator,
+  TranslationBundle
+} from '@jupyterlab/translation';
+
+import { Widget } from '@lumino/widgets';
 
 import { BifrostPanel } from './BifrostPanel';
+
+import { createDashboardWidget, dashboardWidgetId } from './DashboardWidget';
 
 /**
  * Initialization data for the bifrost-jupyter extension.
@@ -28,13 +36,50 @@ const plugin: JupyterFrontEndPlugin<void> = {
     notebooks: INotebookTracker,
     translator: ITranslator | null
   ) => {
+    const trans = (translator ?? nullTranslator).load('bifrost-jupyter');
     const panel = new BifrostPanel(
       app.serviceManager.serverSettings,
       notebooks,
-      translator ?? undefined
+      translator ?? undefined,
+      openDashboardHandler(app, trans)
     );
     app.shell.add(panel, 'left', { rank: 200 });
   }
 };
+
+/**
+ * Show a cluster's proxied Ray dashboard in a main-area tab, reusing the tab if
+ * one is already open for that cluster.
+ *
+ * The URL comes from the panel (``api.dashboardUrl``) and is same-origin, so the
+ * iframe is embeddable — see ``DashboardWidget`` for the framing evidence.
+ */
+function openDashboardHandler(
+  app: JupyterFrontEnd,
+  trans: TranslationBundle
+): (args: { id: string; url: string }) => void {
+  const open = new Map<string, Widget>();
+
+  return ({ id, url }) => {
+    const existing = open.get(id);
+    if (existing && !existing.isDisposed) {
+      app.shell.activateById(existing.id);
+      return;
+    }
+
+    const widget = createDashboardWidget(id, url, trans);
+    // Keyed by cluster id so a second click focuses the tab instead of stacking
+    // duplicates; dropped again when the user closes it.
+    open.set(id, widget);
+    widget.disposed.connect(() => {
+      if (open.get(id) === widget) {
+        open.delete(id);
+      }
+    });
+
+    app.shell.add(widget, 'main');
+    app.shell.activateById(dashboardWidgetId(id));
+  };
+}
 
 export default plugin;

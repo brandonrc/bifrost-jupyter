@@ -152,3 +152,44 @@
   font-size: var(--jp-ui-font-size0);
   word-break: break-all;
 }
+
+/* The main-area tab hosting a cluster's proxied Ray dashboard. */
+.jp-BifrostDashboard {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--jp-layout-color1);
+  color: var(--jp-ui-font-color1);
+}
+
+.jp-BifrostDashboard-toolbar {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 8px;
+  align-items: center;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--jp-border-color2);
+  font-size: var(--jp-ui-font-size0);
+}
+
+.jp-BifrostDashboard-cluster {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--jp-ui-font-color2);
+  font-family: var(--jp-code-font-family);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.jp-BifrostDashboard-link {
+  flex: 0 0 auto;
+  color: var(--jp-content-link-color);
+}
+
+.jp-BifrostDashboard-frame {
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 0;
+  border: none;
+}

@@ -18,6 +18,7 @@ import { Widget } from '@lumino/widgets';
 
 import {
   createCluster,
+  dashboardUrl,
   EnvVars,
   getAddress,
   getJobStatus,
@@ -41,6 +42,13 @@ const JOB_POLL_INTERVAL_MS = 3000;
 const TERMINAL_JOB_STATES = ['SUCCEEDED', 'FAILED', 'STOPPED'];
 
 /**
+ * How the panel hands a cluster's proxied dashboard URL to whatever can display
+ * it. ``index.ts`` supplies a handler that opens an in-Lab iframe tab; without
+ * one (the panel on its own) the URL opens in a new browser tab.
+ */
+export type OpenDashboard = (args: { id: string; url: string }) => void;
+
+/**
  * The "Ray Clusters" sidebar panel (design §3.1).
  *
  * A profile dropdown (from ``GET /bifrost/profiles``), a Start button that is
@@ -51,6 +59,7 @@ const TERMINAL_JOB_STATES = ['SUCCEEDED', 'FAILED', 'STOPPED'];
 export class BifrostPanel extends Widget {
   private _serverSettings: ServerConnection.ISettings;
   private _notebooks: INotebookTracker | undefined;
+  private _openDashboard: OpenDashboard | undefined;
   private _trans: TranslationBundle;
   private _select: HTMLSelectElement;
   private _startButton: HTMLButtonElement;
@@ -78,11 +87,13 @@ export class BifrostPanel extends Widget {
   constructor(
     serverSettings: ServerConnection.ISettings,
     notebooks?: INotebookTracker,
-    translator?: ITranslator
+    translator?: ITranslator,
+    openDashboard?: OpenDashboard
   ) {
     super();
     this._serverSettings = serverSettings;
     this._notebooks = notebooks;
+    this._openDashboard = openDashboard;
     this._trans = (translator ?? nullTranslator).load('bifrost-jupyter');
     const trans = this._trans;
 
@@ -425,8 +436,8 @@ export class BifrostPanel extends Widget {
 
   /**
    * The per-cluster action buttons, gated on the cluster's coarse state:
-   * Connect + Suspend when running, Resume when suspended, and Stop always
-   * (Stop is destructive and confirms first).
+   * Connect + Dashboard + Suspend when running, Resume when suspended, and Stop
+   * always (Stop is destructive and confirms first).
    */
   private _clusterActions(cluster: ICluster): HTMLDivElement {
     const actions = document.createElement('div');
@@ -441,6 +452,13 @@ export class BifrostPanel extends Widget {
           this._trans.__('Connect'),
           'jp-BifrostPanel-connect',
           () => this._onConnect(cluster.id)
+        )
+      );
+      actions.appendChild(
+        this._actionButton(
+          this._trans.__('Dashboard'),
+          'jp-BifrostPanel-dashboard',
+          () => this._onDashboard(cluster.id)
         )
       );
       actions.appendChild(
@@ -583,6 +601,26 @@ export class BifrostPanel extends Widget {
         true
       );
     }
+  }
+
+  /**
+   * "Dashboard": open the cluster's Ray dashboard, re-served same-origin by the
+   * server extension at ``/bifrost/clusters/{id}/dashboard/``.
+   *
+   * Only offered for *running* clusters — a stopped or suspended cluster has no
+   * head service to proxy to, and the route would answer 502. There is no
+   * network call here: the URL is derived from the base URL and the id, and the
+   * browser fetches it.
+   */
+  private _onDashboard(id: string): void {
+    const url = dashboardUrl(this._serverSettings, id);
+    if (this._openDashboard) {
+      this._openDashboard({ id, url });
+      return;
+    }
+    // No in-Lab host wired up (the panel used standalone): a new browser tab is
+    // the honest fallback. ``noopener`` keeps the opened tab off ``window.opener``.
+    window.open(url, '_blank', 'noopener,noreferrer');
   }
 
   /**

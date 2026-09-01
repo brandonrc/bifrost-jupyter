@@ -18,6 +18,7 @@ from tornado.httpclient import HTTPClientError, HTTPResponse
 
 from bifrost_jupyter import _jobs, handlers
 from bifrost_jupyter.bifrost import BifrostAPIError, BifrostConfigError
+from bifrost_jupyter.tests import ROUTE_SSRF_IDS
 
 TOKEN = "mob_supersecrettoken"
 
@@ -600,3 +601,92 @@ async def test_get_job_status_non_json_body_is_graceful(jp_fetch, monkeypatch):
         await jp_fetch("bifrost", "clusters", "cl-1", "jobs", "raysubmit_abc", method="GET")
     assert exc.value.code == 502
     assert json.loads(exc.value.response.body)["error"] == "invalid response from ray cluster"
+
+
+# --- SSRF regression: cluster-id validation on every {id}-taking route ---------
+#
+# An id is a caller-controlled path segment interpolated straight into the
+# head-service host and into the Bifrost control-plane URL. Unvalidated,
+# ``evil.example:9999?`` made the *server* connect to an attacker-chosen host.
+# Each route must answer a clean 400 and issue no upstream call at all.
+
+
+@pytest.mark.parametrize("cluster_id", ROUTE_SSRF_IDS)
+async def test_get_address_rejects_a_malformed_cluster_id(jp_fetch, cluster_id):
+    with pytest.raises(HTTPClientError) as exc:
+        await jp_fetch("bifrost", "clusters", cluster_id, "address")
+    assert exc.value.code == 400
+    body = exc.value.response.body.decode()
+    assert json.loads(body)["error"] == "invalid cluster id"
+    # No address was derived, so nothing leaked back for the caller to read.
+    assert "head-svc" not in body
+
+
+@pytest.mark.parametrize("cluster_id", ROUTE_SSRF_IDS)
+async def test_post_job_rejects_a_malformed_cluster_id(jp_fetch, ray_server, cluster_id):
+    server = ray_server(body={"submission_id": "raysubmit_abc"})
+
+    with pytest.raises(HTTPClientError) as exc:
+        await jp_fetch(
+            "bifrost",
+            "clusters",
+            cluster_id,
+            "jobs",
+            method="POST",
+            body='{"entrypoint": "echo hi"}',
+        )
+    assert exc.value.code == 400
+    assert json.loads(exc.value.response.body)["error"] == "invalid cluster id"
+    assert server.requests == []
+
+
+@pytest.mark.parametrize("cluster_id", ROUTE_SSRF_IDS)
+async def test_get_job_status_rejects_a_malformed_cluster_id(jp_fetch, ray_server, cluster_id):
+    server = ray_server(body={"status": "RUNNING"})
+
+    with pytest.raises(HTTPClientError) as exc:
+        await jp_fetch("bifrost", "clusters", cluster_id, "jobs", "raysubmit_abc", method="GET")
+    assert exc.value.code == 400
+    assert server.requests == []
+
+
+@pytest.mark.parametrize("cluster_id", ROUTE_SSRF_IDS)
+async def test_delete_cluster_rejects_a_malformed_cluster_id(jp_fetch, patch_client, cluster_id):
+    client = patch_client(FakeClient())
+
+    with pytest.raises(HTTPClientError) as exc:
+        await jp_fetch("bifrost", "clusters", cluster_id, method="DELETE")
+    assert exc.value.code == 400
+    assert json.loads(exc.value.response.body)["error"] == "invalid cluster id"
+    # The id also lands in the Bifrost control-plane URL — no call was made.
+    assert client.actions == []
+
+
+@pytest.mark.parametrize("action", ["suspend", "resume"])
+@pytest.mark.parametrize("cluster_id", ROUTE_SSRF_IDS)
+async def test_lifecycle_rejects_a_malformed_cluster_id(
+    jp_fetch, patch_client, cluster_id, action
+):
+    client = patch_client(FakeClient())
+
+    with pytest.raises(HTTPClientError) as exc:
+        await jp_fetch("bifrost", "clusters", cluster_id, action, method="POST", body="")
+    assert exc.value.code == 400
+    assert client.actions == []
+
+
+async def test_reviewer_repro_is_rejected_on_the_jobs_route_too(jp_fetch, ray_server):
+    # Same root cause as the dashboard finding, same payload, already-merged route.
+    server = ray_server(body={"submission_id": "raysubmit_abc"})
+
+    with pytest.raises(HTTPClientError) as exc:
+        await jp_fetch(
+            "bifrost",
+            "clusters",
+            "evil.example:9999?",
+            "jobs",
+            method="POST",
+            body='{"entrypoint": "echo hi"}',
+        )
+    assert exc.value.code == 400
+    assert server.requests == []

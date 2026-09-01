@@ -292,6 +292,33 @@ export async function submitJob(
   );
 }
 
+/**
+ * The same-origin URL of a cluster's proxied Ray dashboard.
+ *
+ * This is a URL *builder*, not a request: the browser (an iframe, or a new tab)
+ * loads it directly. It is still built here so it obeys the same invariant as
+ * every call in this module — rooted at ``serverSettings.baseUrl``, so it can
+ * only ever point at the user's own Jupyter server, never at Bifrost, never at
+ * the in-cluster head service, and it carries no token.
+ *
+ * The **trailing slash is load-bearing**: Ray's dashboard resolves its assets and
+ * its API calls relative to the document URL, so without it the browser would
+ * resolve them one path segment too high. (The server also redirects the
+ * slash-less form here, but building it right avoids the extra round trip.)
+ */
+export function dashboardUrl(
+  serverSettings: ServerConnection.ISettings,
+  id: string
+): string {
+  return (
+    URLExt.join(
+      serverSettings.baseUrl,
+      API_NAMESPACE,
+      clusterPath(id, 'dashboard')
+    ) + '/'
+  );
+}
+
 /** ``GET /bifrost/clusters/{id}/jobs/{job_id}`` — one submitted job's status. */
 export async function getJobStatus(
   serverSettings: ServerConnection.ISettings,

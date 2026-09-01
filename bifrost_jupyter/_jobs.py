@@ -9,8 +9,16 @@ Jobs REST API on the cluster's head service.
 path does not go through Bifrost at all — the jupyter-server extension runs
 inside the user's notebook pod, which carries the ``bifrost.dev/owner`` label,
 and the tier-2 per-owner NetworkPolicy (``kuberay.go``) admits exactly that pod
-to the head service on :8265. Reachability *is* the authorization; there is no
-bearer token on this path and none must be added.
+to the head service on :8265. There is no bearer token on this path and none must
+be added.
+
+What stands in for one is *two* things, not one: the NetworkPolicy's reachability
+**and** a cluster id validated by :func:`bifrost_jupyter._address.validate_cluster_id`.
+Reachability alone is not authorization — the id is a caller-controlled path
+segment interpolated into the host, so an unvalidated one would let the caller
+choose which host this server connects to, from inside the cluster network. The
+id check is what pins the target to a head service in the configured namespace;
+the NetworkPolicy is what makes reaching it legitimate.
 
 **No Ray SDK.** ``ray`` stays the optional ``[kernel]`` extra (the per-user
 server pod is not bloated with it), so the wire contract is spoken directly over
