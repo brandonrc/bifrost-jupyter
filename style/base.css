@@ -3,3 +3,83 @@
 
     https://jupyterlab.readthedocs.io/en/stable/developer/css.html
 */
+
+.jp-BifrostPanel {
+  padding: 12px;
+  overflow: auto;
+  color: var(--jp-ui-font-color1);
+  font-size: var(--jp-ui-font-size1);
+}
+
+.jp-BifrostPanel-header {
+  margin: 0 0 12px;
+  font-size: var(--jp-ui-font-size2);
+}
+
+.jp-BifrostPanel-controls {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.jp-BifrostPanel-select {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.jp-BifrostPanel-start {
+  flex: 0 0 auto;
+}
+
+.jp-BifrostPanel-message {
+  margin-bottom: 8px;
+  padding: 6px 8px;
+  border-radius: 2px;
+  background: var(--jp-layout-color2);
+  font-size: var(--jp-ui-font-size0);
+}
+
+.jp-BifrostPanel-message.jp-mod-error {
+  background: var(--jp-error-color3);
+  color: var(--jp-error-color1);
+}
+
+.jp-BifrostPanel-statusHeader {
+  margin: 12px 0 6px;
+  font-size: var(--jp-ui-font-size1);
+}
+
+.jp-BifrostPanel-statusList {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.jp-BifrostPanel-statusItem {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--jp-border-color2);
+}
+
+.jp-BifrostPanel-clusterId {
+  overflow: hidden;
+  font-family: var(--jp-code-font-family);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.jp-BifrostPanel-clusterState {
+  flex: 0 0 auto;
+  text-transform: uppercase;
+  font-size: var(--jp-ui-font-size0);
+}
+
+.jp-BifrostPanel-empty,
+.jp-BifrostPanel-statusError {
+  padding: 4px 0;
+  color: var(--jp-ui-font-color2);
+  font-size: var(--jp-ui-font-size0);
+}

@@ -17,9 +17,11 @@ TOKEN = "mob_supersecrettoken"
 
 
 class FakeClient:
-    def __init__(self, *, view=None, create_error=None):
+    def __init__(self, *, view=None, create_error=None, clusters=None, list_error=None):
         self._view = view
         self._create_error = create_error
+        self._clusters = clusters or []
+        self._list_error = list_error
         self.created = None
 
     def create_cluster(self, body):
@@ -29,6 +31,11 @@ class FakeClient:
 
     def get_cluster(self, cluster_id):
         return self._view
+
+    def list_clusters(self):
+        if self._list_error:
+            raise self._list_error
+        return self._clusters
 
 
 @pytest.fixture
@@ -112,6 +119,51 @@ async def test_post_clusters_rejects_raw_spec_passthrough(jp_fetch, patch_client
     assert created.spec.image == "rayproject/ray:2.9.0"  # from the profile, not the body
     assert created.spec.head_cpu == "1"  # from the profile, not the body
     assert created.spec.owner is None  # never accepted from the client
+
+
+async def test_get_clusters_returns_list_with_id_and_state(jp_fetch, patch_client):
+    views = [
+        SimpleNamespace(id="jl-small-aaa", observed_state="running", desired="running"),
+        SimpleNamespace(id="jl-gpu-bbb", observed_state=None, desired="pending"),
+    ]
+    patch_client(FakeClient(clusters=views))
+
+    resp = await jp_fetch("bifrost", "clusters", method="GET")
+    assert resp.code == 200
+    payload = json.loads(resp.body)
+
+    assert payload["clusters"] == [
+        {"id": "jl-small-aaa", "state": "running"},
+        {"id": "jl-gpu-bbb", "state": "pending"},  # falls back to desired
+    ]
+    # The token must never be echoed back to the browser.
+    assert TOKEN not in resp.body.decode()
+
+
+async def test_get_clusters_empty(jp_fetch, patch_client):
+    patch_client(FakeClient(clusters=[]))
+    resp = await jp_fetch("bifrost", "clusters", method="GET")
+    assert resp.code == 200
+    assert json.loads(resp.body)["clusters"] == []
+
+
+async def test_get_clusters_maps_upstream_error(jp_fetch, patch_client):
+    patch_client(FakeClient(list_error=BifrostAPIError(403, "forbidden")))
+    with pytest.raises(HTTPClientError) as exc:
+        await jp_fetch("bifrost", "clusters", method="GET")
+    assert exc.value.code == 403
+    assert json.loads(exc.value.response.body)["error"] == "forbidden"
+
+
+async def test_get_clusters_config_error(jp_fetch, monkeypatch):
+    def boom():
+        raise BifrostConfigError("no token")
+
+    monkeypatch.setattr(handlers, "client_from_env", boom)
+    with pytest.raises(HTTPClientError) as exc:
+        await jp_fetch("bifrost", "clusters", method="GET")
+    assert exc.value.code == 500
+    assert json.loads(exc.value.response.body)["error"] == "bifrost extension is not configured"
 
 
 async def test_get_profiles_returns_safe_view(jp_fetch):

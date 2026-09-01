@@ -78,6 +78,14 @@ class BifrostClient:
         except ApiException as exc:
             raise _translate(exc) from None
 
+    def list_clusters(self) -> list[ClusterView]:
+        # Wraps Bifrost's project-scoped ``GET /api/v1/clusters`` (Read); the
+        # server-side token scopes the result to the clusters the user may see.
+        try:
+            return self._clusters.list_clusters()
+        except ApiException as exc:
+            raise _translate(exc) from None
+
     def delete_cluster(self, cluster_id: str) -> None:
         try:
             self._clusters.delete_cluster(cluster_id)

@@ -29,6 +29,28 @@ def test_create_cluster_passes_body_through():
     assert captured["body"] is body
 
 
+def test_list_clusters_passes_through():
+    client = bifrost.BifrostClient(API_URL, TOKEN)
+    views = [object(), object()]
+    client._clusters.list_clusters = lambda: views
+    assert client.list_clusters() is views
+
+
+def test_list_clusters_translates_error():
+    client = bifrost.BifrostClient(API_URL, TOKEN)
+
+    def raiser():
+        raise ApiException(status=403, reason="upstream", body="SECRET internal detail")
+
+    client._clusters.list_clusters = raiser
+    with pytest.raises(bifrost.BifrostAPIError) as exc_info:
+        client.list_clusters()
+    err = exc_info.value
+    assert err.status == 403
+    assert err.message == "forbidden"
+    assert "SECRET" not in str(err)
+
+
 @pytest.mark.parametrize(
     "status,expected_status,expected_msg",
     [
