@@ -31,6 +31,21 @@ class _BifrostHandler(APIHandler):
         # Raises BifrostConfigError if env is not configured; caught by callers.
         return client_from_env()
 
+    def _write_client_or_fail(self, action: str):
+        """Return a configured client, or answer a clean 409 and return ``None``.
+
+        A lifecycle action (stop/suspend/resume) is a deliberate user action, so —
+        exactly like ``POST /clusters`` — an unconfigured extension maps to a clean
+        409 logged at *warning* (never a 5xx / error-level ServerApp log), rather
+        than the graceful ``configured:false`` 200 the load-time GET poll uses.
+        """
+        try:
+            return self._client()
+        except BifrostConfigError:
+            self.log.warning("bifrost: %s requested but extension is not configured", action)
+            self._fail(409, "bifrost not configured")
+            return None
+
     def _allowlist(self):
         # Resolved at extension load; defaults to the built-in set if unset.
         return self.settings.get("bifrost_profiles") or _profiles.DEFAULT_PROFILES
@@ -149,6 +164,53 @@ class ClusterAddressHandler(_BifrostHandler):
         )
 
 
+class ClusterHandler(_BifrostHandler):
+    """``DELETE /bifrost/clusters/{id}`` — stop (tear down) a cluster.
+
+    Maps to :meth:`BifrostClient.delete_cluster` (Bifrost ``DELETE
+    /api/v1/clusters/{id}``). Stopping is destructive; the browser panel gates it
+    behind a confirm, and the credential is attached server-side, never returned.
+    """
+
+    @tornado.web.authenticated
+    def delete(self, cluster_id: str) -> None:
+        client = self._write_client_or_fail("stop")
+        if client is None:
+            return
+        try:
+            client.delete_cluster(cluster_id)
+        except BifrostAPIError as exc:
+            self._fail(exc.status, exc.message)
+            return
+        # Bifrost tears down asynchronously (202); report the transitional state.
+        self.set_status(202)
+        self.finish(json.dumps({"id": cluster_id, "status": "stopping"}))
+
+
+class ClusterLifecycleHandler(_BifrostHandler):
+    """``POST /bifrost/clusters/{id}/{suspend|resume}`` — suspend/resume a cluster.
+
+    The action is captured from the path and dispatched to
+    :meth:`BifrostClient.suspend_cluster` / :meth:`~BifrostClient.resume_cluster`.
+    Both are project-scoped Write ops that work for a normal token.
+    """
+
+    _TRANSITIONS = {"suspend": "suspending", "resume": "resuming"}
+
+    @tornado.web.authenticated
+    def post(self, cluster_id: str, action: str) -> None:
+        client = self._write_client_or_fail(action)
+        if client is None:
+            return
+        op = client.suspend_cluster if action == "suspend" else client.resume_cluster
+        try:
+            op(cluster_id)
+        except BifrostAPIError as exc:
+            self._fail(exc.status, exc.message)
+            return
+        self.finish(json.dumps({"id": cluster_id, "status": self._TRANSITIONS[action]}))
+
+
 def setup_handlers(web_app, namespace: str | None = None, profiles=None) -> None:
     host_pattern = ".*$"
     base_url = web_app.settings["base_url"]
@@ -157,7 +219,12 @@ def setup_handlers(web_app, namespace: str | None = None, profiles=None) -> None
 
     profiles_url = url_path_join(base_url, "bifrost", "profiles")
     clusters = url_path_join(base_url, "bifrost", "clusters")
+    # Each pattern is anchored with ``$`` by tornado, and ``([^/]+)`` never spans a
+    # slash, so ``/clusters/{id}``, ``/clusters/{id}/address`` and
+    # ``/clusters/{id}/{suspend|resume}`` are mutually exclusive — order-independent.
+    cluster = url_path_join(base_url, "bifrost", "clusters", r"([^/]+)")
     address = url_path_join(base_url, "bifrost", "clusters", r"([^/]+)", "address")
+    lifecycle = url_path_join(base_url, "bifrost", "clusters", r"([^/]+)", r"(suspend|resume)")
 
     web_app.add_handlers(
         host_pattern,
@@ -165,5 +232,7 @@ def setup_handlers(web_app, namespace: str | None = None, profiles=None) -> None
             (profiles_url, ProfilesHandler),
             (clusters, ClustersHandler),
             (address, ClusterAddressHandler),
+            (lifecycle, ClusterLifecycleHandler),
+            (cluster, ClusterHandler),
         ],
     )

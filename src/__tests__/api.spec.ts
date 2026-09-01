@@ -1,6 +1,14 @@
 import { ServerConnection } from '@jupyterlab/services';
 
-import { createCluster, listClusters, listProfiles } from '../api';
+import {
+  createCluster,
+  getAddress,
+  listClusters,
+  listProfiles,
+  resumeCluster,
+  stopCluster,
+  suspendCluster
+} from '../api';
 
 /**
  * The security invariant under test: api.ts only ever calls the co-located
@@ -84,6 +92,76 @@ describe('api same-origin invariant', () => {
       expect(url as string).not.toMatch(/bifrost.*\.(com|net|io|svc)/i);
 
       // No Authorization / bearer token is set by the browser client.
+      const headers = ((init as RequestInit)?.headers ?? {}) as Record<
+        string,
+        string
+      >;
+      const headerKeys = Object.keys(headers).map(k => k.toLowerCase());
+      expect(headerKeys).not.toContain('authorization');
+    }
+  });
+
+  it('stopCluster DELETEs <baseUrl>/bifrost/clusters/{id}', async () => {
+    captureRequests({ id: 'jl-small-abc', status: 'stopping' });
+    await stopCluster(makeSettings(), 'jl-small-abc');
+
+    const urls = requestedUrls();
+    expect(urls).toHaveLength(1);
+    expect(urls[0]).toBe(`${BASE_URL}bifrost/clusters/jl-small-abc`);
+    expect((spy.mock.calls[0][1] as RequestInit).method).toBe('DELETE');
+  });
+
+  it('suspendCluster POSTs <baseUrl>/bifrost/clusters/{id}/suspend', async () => {
+    captureRequests({ id: 'jl-small-abc', status: 'suspending' });
+    await suspendCluster(makeSettings(), 'jl-small-abc');
+
+    const urls = requestedUrls();
+    expect(urls).toHaveLength(1);
+    expect(urls[0]).toBe(`${BASE_URL}bifrost/clusters/jl-small-abc/suspend`);
+    expect((spy.mock.calls[0][1] as RequestInit).method).toBe('POST');
+  });
+
+  it('resumeCluster POSTs <baseUrl>/bifrost/clusters/{id}/resume', async () => {
+    captureRequests({ id: 'jl-small-abc', status: 'resuming' });
+    await resumeCluster(makeSettings(), 'jl-small-abc');
+
+    const urls = requestedUrls();
+    expect(urls).toHaveLength(1);
+    expect(urls[0]).toBe(`${BASE_URL}bifrost/clusters/jl-small-abc/resume`);
+    expect((spy.mock.calls[0][1] as RequestInit).method).toBe('POST');
+  });
+
+  it('getAddress GETs <baseUrl>/bifrost/clusters/{id}/address', async () => {
+    captureRequests({
+      jobs_address: 'http://x-head-svc.bifrost.svc:8265',
+      ray_client_address: 'ray://x-head-svc.bifrost.svc:10001',
+      snippet: 'from ray.job_submission import JobSubmissionClient\n'
+    });
+    const address = await getAddress(makeSettings(), 'jl-small-abc');
+
+    const urls = requestedUrls();
+    expect(urls).toHaveLength(1);
+    expect(urls[0]).toBe(`${BASE_URL}bifrost/clusters/jl-small-abc/address`);
+    expect(address.snippet).toContain('JobSubmissionClient');
+  });
+
+  it('all lifecycle + address calls stay same-origin and tokenless', async () => {
+    captureRequests({
+      id: 'x',
+      status: 'ok',
+      jobs_address: 'a',
+      ray_client_address: 'b',
+      snippet: 's'
+    });
+    const s = makeSettings();
+    await stopCluster(s, 'jl-x');
+    await suspendCluster(s, 'jl-x');
+    await resumeCluster(s, 'jl-x');
+    await getAddress(s, 'jl-x');
+
+    for (const [url, init] of spy.mock.calls) {
+      expect(url as string).toContain(`${BASE_URL}bifrost/`);
+      expect(url as string).not.toMatch(/bifrost.*\.(com|net|io|svc)/i);
       const headers = ((init as RequestInit)?.headers ?? {}) as Record<
         string,
         string

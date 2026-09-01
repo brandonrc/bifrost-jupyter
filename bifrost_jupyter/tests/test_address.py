@@ -23,3 +23,15 @@ def test_connect_snippet_has_no_auth_header_and_is_runnable():
     assert "Bearer" not in snippet
     assert "BIFROST_TOKEN" not in snippet
     compile(snippet, "<snippet>", "exec")
+
+
+def test_connect_snippet_offers_ray_client_as_commented_alternative():
+    snippet = _address.connect_snippet("cl-1", "bifrost")
+    # The Ray Client (gRPC) path is present only as an advanced, commented option
+    # with its owner-pod-only caveat — never as active code.
+    assert "ray://cl-1-head-svc.bifrost.svc:10001" in snippet
+    for line in snippet.splitlines():
+        if "ray://" in line or "ray.init" in line:
+            assert line.lstrip().startswith("#"), f"Ray Client line must be commented: {line!r}"
+    # Still runnable: the commented lines don't break compilation.
+    compile(snippet, "<snippet>", "exec")

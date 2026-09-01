@@ -41,10 +41,23 @@ def ray_client_address(cluster_id: str, namespace: str) -> str:
 
 
 def connect_snippet(cluster_id: str, namespace: str) -> str:
-    """A runnable ``JobSubmissionClient`` snippet — no auth header needed."""
+    """A runnable ``JobSubmissionClient`` snippet — no auth header needed.
+
+    The Ray Client (``ray://…:10001``, gRPC) path is offered only as a commented
+    *advanced* alternative: it is reachable **only** from the cluster owner's
+    notebook pod (the per-owner NetworkPolicy gates :10001), so it is not the
+    default. The Jobs API line above is the recommended, remotely-usable path.
+    """
     address = jobs_address(cluster_id, namespace)
+    ray_client = ray_client_address(cluster_id, namespace)
     return (
         "from ray.job_submission import JobSubmissionClient\n"
         "\n"
         f'client = JobSubmissionClient("{address}")\n'
+        "\n"
+        "# Advanced (in-cluster, owner-pod-only) alternative: the Ray Client gRPC\n"
+        "# endpoint is reachable only from the cluster owner's notebook pod, gated\n"
+        "# by the per-owner NetworkPolicy (no auth header needed there).\n"
+        "# import ray\n"
+        f'# ray.init("{ray_client}")\n'
     )

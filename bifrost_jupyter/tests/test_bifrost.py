@@ -36,6 +36,32 @@ def test_list_clusters_passes_through():
     assert client.list_clusters() is views
 
 
+@pytest.mark.parametrize("op", ["delete_cluster", "suspend_cluster", "resume_cluster"])
+def test_lifecycle_ops_pass_id_through(op):
+    client = bifrost.BifrostClient(API_URL, TOKEN)
+    captured = {}
+    setattr(client._clusters, op, lambda cluster_id: captured.setdefault("id", cluster_id))
+
+    getattr(client, op)("cl-42")
+    assert captured["id"] == "cl-42"
+
+
+@pytest.mark.parametrize("op", ["delete_cluster", "suspend_cluster", "resume_cluster"])
+def test_lifecycle_ops_translate_error(op):
+    client = bifrost.BifrostClient(API_URL, TOKEN)
+
+    def raiser(_cluster_id):
+        raise ApiException(status=409, reason="upstream", body="SECRET internal detail")
+
+    setattr(client._clusters, op, raiser)
+    with pytest.raises(bifrost.BifrostAPIError) as exc_info:
+        getattr(client, op)("cl-1")
+    err = exc_info.value
+    assert err.status == 409
+    assert err.message == "conflict"
+    assert "SECRET" not in str(err)
+
+
 def test_list_clusters_translates_error():
     client = bifrost.BifrostClient(API_URL, TOKEN)
 
