@@ -25,6 +25,7 @@ import functools
 import http.client
 import json
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, TypeVar
 from urllib.parse import quote
 
@@ -75,6 +76,55 @@ class _ClusterIdMixin:
 
 _T = TypeVar("_T")
 
+#: Size of this extension's own thread pool.
+#:
+#: Small on purpose. The work is I/O-bound and already serialised twice over —
+#: credential resolution holds a lock, and everything downstream talks to one
+#: Bifrost — so more threads would buy queueing, not throughput. Four leaves
+#: room for a stalled call plus the panel's status poll and a user action.
+BLOCKING_POOL_SIZE = 4
+
+#: Prefix for the pool's thread names, so a stack dump or a `py-spy` attach says
+#: whose threads these are rather than showing anonymous workers.
+BLOCKING_POOL_PREFIX = "bifrost-jupyter"
+
+_EXECUTOR: ThreadPoolExecutor | None = None
+
+
+def blocking_executor() -> ThreadPoolExecutor:
+    """This extension's own bounded thread pool.
+
+    Deliberately **not** the default executor that ``run_in_executor(None, …)``
+    would use. That one is created per event loop and shared with the entire
+    jupyter-server process: every other extension, and jupyter-server's own
+    ``run_in_executor`` calls, draw from it. Filling it with our slow Bifrost
+    calls would starve them — which is the same harm Task 11 set out to fix,
+    moved one layer down from the IOLoop to the pool, and harder to see.
+
+    A cold-cache credential resolve can hold a thread for tens of seconds
+    (refresh, then exchange, then mint, each bounded), and the resolver's lock
+    serialises concurrent resolves, so a handful of simultaneous panel requests
+    genuinely can occupy several threads at once. Owning the pool keeps that
+    cost inside this extension.
+
+    **Saturation queues, it does not fail.** ``ThreadPoolExecutor``'s work queue
+    is unbounded, so when all four threads are busy further requests wait their
+    turn rather than being rejected. That is the right trade here — a queued
+    panel poll is a slow panel, a rejected one is an error in the user's face —
+    and it is bounded in practice because every outbound call carries a timeout
+    (``bifrost.REQUEST_TIMEOUT_SECONDS``), so a thread cannot be held forever.
+    The same bound caps how long interpreter shutdown can wait on these threads.
+
+    Created lazily and shared process-wide: one pool per server, not per handler
+    instance or per request.
+    """
+    global _EXECUTOR
+    if _EXECUTOR is None:
+        _EXECUTOR = ThreadPoolExecutor(
+            max_workers=BLOCKING_POOL_SIZE, thread_name_prefix=BLOCKING_POOL_PREFIX
+        )
+    return _EXECUTOR
+
 
 class _BifrostHandler(_ClusterIdMixin, APIHandler):
     """Shared error handling for Bifrost-backed routes.
@@ -89,10 +139,13 @@ class _BifrostHandler(_ClusterIdMixin, APIHandler):
 
     So the blocking work goes to a thread pool (:meth:`_blocking`) and the
     handlers are ``async``. That is one half of the fix; the other is the
-    explicit ``_request_timeout`` on every outbound call
-    (``bifrost.REQUEST_TIMEOUT_SECONDS``), without which a connected-but-silent
-    server would pin a pool thread forever and eventually starve the pool back
-    into the same freeze.
+    request timeout on every outbound call (:mod:`bifrost_jupyter._apiclient`),
+    without which a connected-but-silent server would pin a pool thread forever
+    and eventually starve the pool back into the same freeze.
+
+    The pool is this extension's own (:func:`blocking_executor`), not the
+    process-wide default, so a slow Bifrost cannot starve jupyter-server or
+    another extension either.
     """
 
     def _fail(self, status: int, message: str) -> None:
@@ -100,14 +153,17 @@ class _BifrostHandler(_ClusterIdMixin, APIHandler):
         self.finish(json.dumps({"error": message}))
 
     async def _blocking(self, func: Callable[..., _T], *args: Any, **kwargs: Any) -> _T:
-        """Run ``func`` on the IOLoop's thread pool, awaiting the result.
+        """Run ``func`` on this extension's own thread pool, awaiting the result.
+
+        The pool is ours, not the process-wide default — see
+        :func:`blocking_executor` for why that distinction matters.
 
         Exceptions propagate to the caller as if it had been called inline, so
         the ``BifrostAPIError``/``BifrostConfigError`` handling around each call
         site is unchanged.
         """
         return await IOLoop.current().run_in_executor(
-            None, functools.partial(func, *args, **kwargs)
+            blocking_executor(), functools.partial(func, *args, **kwargs)
         )
 
     async def _client(self):
