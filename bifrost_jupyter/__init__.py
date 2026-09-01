@@ -35,7 +35,17 @@ def _load_jupyter_server_extension(server_app):
     server_app: jupyterlab.labapp.LabApp
         JupyterLab application instance
     """
+    from . import _profiles
+
     config = BifrostConfig(config=server_app.config)
-    setup_handlers(server_app.web_app, namespace=config.cluster_namespace)
+    profiles = _profiles.resolve_profiles(config.profiles)
+    setup_handlers(
+        server_app.web_app,
+        namespace=config.cluster_namespace,
+        profiles=profiles,
+    )
     name = "bifrost_jupyter"
-    server_app.log.info(f"Registered {name} server extension")
+    server_app.log.info(
+        f"Registered {name} server extension "
+        f"({len(profiles)} profile(s): {', '.join(sorted(profiles))})"
+    )
