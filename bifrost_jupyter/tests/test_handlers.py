@@ -11,14 +11,17 @@ so there it is tornado's ``AsyncHTTPClient`` that is faked.
 
 import io
 import json
+import time
 from types import SimpleNamespace
 
 import pytest
+from bifrost_client import ClustersApi
 from tornado.httpclient import HTTPClientError, HTTPResponse
 
-from bifrost_jupyter import _jobs, handlers
+from bifrost_jupyter import _credentials, _jobs, bifrost, handlers
 from bifrost_jupyter.bifrost import BifrostAPIError, BifrostConfigError
 from bifrost_jupyter.tests import ROUTE_SSRF_IDS
+from bifrost_jupyter.tests.test_credentials import make_jwt
 
 TOKEN = "mob_supersecrettoken"
 
@@ -690,3 +693,92 @@ async def test_reviewer_repro_is_rejected_on_the_jobs_route_too(jp_fetch, ray_se
         )
     assert exc.value.code == 400
     assert server.requests == []
+
+
+# --- credential problems reach the panel as actionable errors (Task 9) -----
+#
+# A credential that exists but cannot be used is neither the bare-install
+# "unconfigured" state nor an unhandled 500: it is a real status with a message
+# the user can act on. Before Task 9 the handlers caught only BifrostConfigError
+# around client construction, so this path was a 500.
+
+CREDENTIAL_ERROR_MESSAGE = "the notebook's OIDC access token has expired and could not be refreshed"
+
+
+@pytest.fixture
+def stale_credential(monkeypatch):
+    def boom():
+        raise BifrostAPIError(401, CREDENTIAL_ERROR_MESSAGE)
+
+    monkeypatch.setattr(handlers, "client_from_env", boom)
+
+
+async def test_get_clusters_reports_a_credential_problem(jp_fetch, stale_credential):
+    with pytest.raises(HTTPClientError) as exc:
+        await jp_fetch("bifrost", "clusters")
+    assert exc.value.code == 401
+    assert json.loads(exc.value.response.body)["error"] == CREDENTIAL_ERROR_MESSAGE
+
+
+async def test_post_clusters_reports_a_credential_problem(jp_fetch, stale_credential):
+    with pytest.raises(HTTPClientError) as exc:
+        await jp_fetch("bifrost", "clusters", method="POST", body='{"profile": "small"}')
+    assert exc.value.code == 401
+    assert json.loads(exc.value.response.body)["error"] == CREDENTIAL_ERROR_MESSAGE
+
+
+async def test_stop_reports_a_credential_problem(jp_fetch, stale_credential):
+    with pytest.raises(HTTPClientError) as exc:
+        await jp_fetch("bifrost", "clusters", "jl-small-0123456789ab", method="DELETE")
+    assert exc.value.code == 401
+    assert json.loads(exc.value.response.body)["error"] == CREDENTIAL_ERROR_MESSAGE
+
+
+@pytest.mark.parametrize("action", ["suspend", "resume"])
+async def test_lifecycle_reports_a_credential_problem(jp_fetch, stale_credential, action):
+    with pytest.raises(HTTPClientError) as exc:
+        await jp_fetch(
+            "bifrost", "clusters", "jl-small-0123456789ab", action, method="POST", body=""
+        )
+    assert exc.value.code == 401
+    assert json.loads(exc.value.response.body)["error"] == CREDENTIAL_ERROR_MESSAGE
+
+
+async def test_start_403_reaches_the_panel_with_the_operator_hint(jp_fetch, patch_client):
+    """The T3 carry-forward: cluster create needs the operator role, so a 403
+    must say that rather than leaving the user with a bare "forbidden"."""
+    forbidden = BifrostAPIError(403, bifrost._LIFECYCLE_FORBIDDEN_MESSAGE)
+    patch_client(FakeClient(create_error=forbidden))
+    with pytest.raises(HTTPClientError) as exc:
+        await jp_fetch("bifrost", "clusters", method="POST", body='{"profile": "small"}')
+    assert exc.value.code == 403
+    assert "operator" in json.loads(exc.value.response.body)["error"]
+
+
+async def test_oidc_credential_never_reaches_the_browser(jp_fetch, monkeypatch):
+    """End-to-end through the real credential resolver: an auth_state-injected
+    OIDC token is what authenticates the outbound call, and none of it appears
+    in the response the panel receives."""
+    oidc = make_jwt(time.time() + 3600)
+    monkeypatch.setenv("BIFROST_API_URL", "https://bifrost.example")
+    monkeypatch.setenv(_credentials.OIDC_TOKEN_ENV_VAR, oidc)
+    monkeypatch.setenv(_credentials.TOKEN_ENV_VAR, TOKEN)
+
+    seen = {}
+
+    def fake_list(self):
+        seen["bearer"] = self.api_client.configuration.auth_settings()["bearer"]["value"]
+        return []
+
+    monkeypatch.setattr(ClustersApi, "list_clusters", fake_list)
+
+    resp = await jp_fetch("bifrost", "clusters")
+
+    assert resp.code == 200
+    assert json.loads(resp.body) == {"clusters": [], "configured": True}
+    # The OIDC token authenticated the outbound call ...
+    assert seen["bearer"] == f"Bearer {oidc}"
+    # ... and neither it nor the dev PAT is anywhere in the response.
+    body = resp.body.decode()
+    assert oidc not in body
+    assert TOKEN not in body

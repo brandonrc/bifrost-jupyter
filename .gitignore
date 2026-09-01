@@ -129,3 +129,8 @@ dmypy.json
 
 # Test artifacts
 junit.xml
+
+# uv lockfile: this project is installed with pip/hatch (CI included) and
+# publishes a wheel, so a uv lockfile is a local convenience artifact, not a
+# tracked input. It reappears whenever someone runs `uv` in the tree.
+uv.lock
