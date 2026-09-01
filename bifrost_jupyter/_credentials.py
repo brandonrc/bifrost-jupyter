@@ -3,9 +3,11 @@
 The credential never reaches the browser: it is resolved here, inside the user's
 notebook pod, and attached to Bifrost control-plane calls by
 :mod:`bifrost_jupyter.bifrost`. Nothing in this module puts a token in a return
-value that a handler serializes, in a log line, or in an exception message —
-:class:`Credential` even redacts itself in ``repr``/``str`` so an accidental
-``%s`` cannot leak it.
+value that a handler serializes, in a log line, or in an exception message.
+:class:`Credential` also refuses the generic ways an object gets dumped —
+``repr``/``str`` redact, and it is neither a dataclass nor an attribute bag, so
+``asdict``/``astuple``/``vars`` cannot walk past that. Reading ``.token`` is the
+one deliberate way out.
 
 Precedence, highest first
 ------------------------
@@ -69,7 +71,6 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -157,18 +158,34 @@ class CredentialError(RuntimeError):
         self.message = message
 
 
-@dataclass(frozen=True)
 class Credential:
     """A resolved bearer token plus where it came from and when it dies.
 
-    ``repr``/``str`` redact the token: this object is passed around, cached and
-    occasionally logged, and a dataclass' generated ``repr`` would print the
-    secret.
+    Deliberately **not** a dataclass, and deliberately ``__slots__``-ed. Both are
+    load-bearing for the "the token does not escape" invariant, because
+    ``__repr__``/``__str__`` redaction alone is not opacity — it only covers the
+    ways a *string* is produced:
+
+    * ``dataclasses.asdict``/``astuple`` walk the declared fields directly and
+      would hand back the plaintext token, redaction untouched. A plain class is
+      not a dataclass, so both raise ``TypeError``;
+    * ``vars()``/``__dict__`` would do the same for any ordinary attribute bag.
+      ``__slots__`` means there is no instance ``__dict__`` to dump.
+
+    Reading ``.token`` is then the single deliberate way to get the secret out,
+    which is what the two call sites that need it do.
     """
 
-    token: str
-    source: str
-    expires_at: float | None = None
+    __slots__ = ("_token", "source", "expires_at")
+
+    def __init__(self, token: str, source: str, expires_at: float | None = None) -> None:
+        self._token = token
+        self.source = source
+        self.expires_at = expires_at
+
+    @property
+    def token(self) -> str:
+        return self._token
 
     def is_expired(self, now: float | None = None) -> bool:
         if self.expires_at is None:
@@ -200,7 +217,13 @@ class CredentialSource(Protocol):
 
 
 class StaticCredential:
-    """A fixed token — the dev/direct case and the shape tests construct."""
+    """A fixed token — the dev/direct case and the shape tests construct.
+
+    ``__slots__`` for the same reason :class:`Credential` has it: no instance
+    ``__dict__``, so ``vars()`` cannot dump the token past ``__repr__``.
+    """
+
+    __slots__ = ("_token",)
 
     def __init__(self, token: str) -> None:
         self._token = token
