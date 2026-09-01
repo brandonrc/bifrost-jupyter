@@ -59,6 +59,25 @@ export interface ICluster {
   state: string;
 }
 
+/** Response of a lifecycle action (stop/suspend/resume). */
+export interface IClusterActionResponse {
+  id: string;
+  status: string;
+}
+
+/**
+ * Response of ``GET /bifrost/clusters/{id}/address`` (design §6).
+ *
+ * All fields are derived server-side from the cluster id + namespace (no Bifrost
+ * call, no token). ``snippet`` is the ready-to-run ``JobSubmissionClient`` cell,
+ * with the Ray Client path included as a commented advanced alternative.
+ */
+export interface IClusterAddress {
+  jobs_address: string;
+  ray_client_address: string;
+  snippet: string;
+}
+
 /** Response of ``GET /bifrost/clusters`` (list/status, design §3.2). */
 export interface IClustersResponse {
   clusters: ICluster[];
@@ -160,4 +179,65 @@ export async function listClusters(
   serverSettings: ServerConnection.ISettings
 ): Promise<IClustersResponse> {
   return bifrostRequest<IClustersResponse>(serverSettings, 'clusters');
+}
+
+/** The ``clusters/{id}`` sub-path for one cluster, id-encoded, same-origin. */
+function clusterPath(id: string, ...rest: string[]): string {
+  return ['clusters', encodeURIComponent(id), ...rest].join('/');
+}
+
+/**
+ * ``DELETE /bifrost/clusters/{id}`` — stop (tear down) a cluster.
+ *
+ * Destructive; the panel gates this behind a confirm. The server attaches the
+ * credential; this call carries no token and no external URL.
+ */
+export async function stopCluster(
+  serverSettings: ServerConnection.ISettings,
+  id: string
+): Promise<IClusterActionResponse> {
+  return bifrostRequest<IClusterActionResponse>(
+    serverSettings,
+    clusterPath(id),
+    { method: 'DELETE' }
+  );
+}
+
+/** ``POST /bifrost/clusters/{id}/suspend`` — scale a running cluster to zero. */
+export async function suspendCluster(
+  serverSettings: ServerConnection.ISettings,
+  id: string
+): Promise<IClusterActionResponse> {
+  return bifrostRequest<IClusterActionResponse>(
+    serverSettings,
+    clusterPath(id, 'suspend'),
+    { method: 'POST' }
+  );
+}
+
+/** ``POST /bifrost/clusters/{id}/resume`` — bring a suspended cluster back up. */
+export async function resumeCluster(
+  serverSettings: ServerConnection.ISettings,
+  id: string
+): Promise<IClusterActionResponse> {
+  return bifrostRequest<IClusterActionResponse>(
+    serverSettings,
+    clusterPath(id, 'resume'),
+    { method: 'POST' }
+  );
+}
+
+/**
+ * ``GET /bifrost/clusters/{id}/address`` — the in-cluster Jobs address + a
+ * ready-to-run ``JobSubmissionClient`` snippet (design §6). Derived server-side;
+ * no Bifrost call, no token.
+ */
+export async function getAddress(
+  serverSettings: ServerConnection.ISettings,
+  id: string
+): Promise<IClusterAddress> {
+  return bifrostRequest<IClusterAddress>(
+    serverSettings,
+    clusterPath(id, 'address')
+  );
 }

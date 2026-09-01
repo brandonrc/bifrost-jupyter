@@ -17,12 +17,23 @@ TOKEN = "mob_supersecrettoken"
 
 
 class FakeClient:
-    def __init__(self, *, view=None, create_error=None, clusters=None, list_error=None):
+    def __init__(
+        self,
+        *,
+        view=None,
+        create_error=None,
+        clusters=None,
+        list_error=None,
+        action_error=None,
+    ):
         self._view = view
         self._create_error = create_error
         self._clusters = clusters or []
         self._list_error = list_error
+        self._action_error = action_error
         self.created = None
+        # (op_name, cluster_id) recorded for each lifecycle call.
+        self.actions = []
 
     def create_cluster(self, body):
         if self._create_error:
@@ -36,6 +47,21 @@ class FakeClient:
         if self._list_error:
             raise self._list_error
         return self._clusters
+
+    def delete_cluster(self, cluster_id):
+        self.actions.append(("delete", cluster_id))
+        if self._action_error:
+            raise self._action_error
+
+    def suspend_cluster(self, cluster_id):
+        self.actions.append(("suspend", cluster_id))
+        if self._action_error:
+            raise self._action_error
+
+    def resume_cluster(self, cluster_id):
+        self.actions.append(("resume", cluster_id))
+        if self._action_error:
+            raise self._action_error
 
 
 @pytest.fixture
@@ -224,6 +250,86 @@ async def test_get_address_returns_in_cluster_snippet(jp_fetch):
     # In-cluster path carries no token / auth header.
     assert TOKEN not in resp.body.decode()
     assert "Authorization" not in resp.body.decode()
+
+
+async def test_delete_cluster_stops_and_returns_202(jp_fetch, patch_client):
+    client = patch_client(FakeClient())
+    resp = await jp_fetch("bifrost", "clusters", "jl-small-aaa", method="DELETE")
+    assert resp.code == 202
+    payload = json.loads(resp.body)
+    assert payload == {"id": "jl-small-aaa", "status": "stopping"}
+    # Mapped to delete_cluster with the path id, and nothing else.
+    assert client.actions == [("delete", "jl-small-aaa")]
+    assert TOKEN not in resp.body.decode()
+
+
+async def test_delete_cluster_maps_not_found(jp_fetch, patch_client):
+    patch_client(FakeClient(action_error=BifrostAPIError(404, "not found")))
+    with pytest.raises(HTTPClientError) as exc:
+        await jp_fetch("bifrost", "clusters", "ghost", method="DELETE")
+    assert exc.value.code == 404
+    assert json.loads(exc.value.response.body)["error"] == "not found"
+    assert TOKEN not in exc.value.response.body.decode()
+
+
+async def test_delete_cluster_unconfigured_is_clean_409(jp_fetch, monkeypatch):
+    # Stop is a deliberate user action → clean 409 (not a 5xx), never a 500.
+    def boom():
+        raise BifrostConfigError("no token")
+
+    monkeypatch.setattr(handlers, "client_from_env", boom)
+    with pytest.raises(HTTPClientError) as exc:
+        await jp_fetch("bifrost", "clusters", "jl-x", method="DELETE")
+    assert exc.value.code == 409
+    assert json.loads(exc.value.response.body)["error"] == "bifrost not configured"
+
+
+async def test_suspend_cluster_maps_to_suspend_op(jp_fetch, patch_client):
+    client = patch_client(FakeClient())
+    resp = await jp_fetch("bifrost", "clusters", "jl-small-aaa", "suspend", method="POST", body="")
+    assert resp.code == 200
+    payload = json.loads(resp.body)
+    assert payload == {"id": "jl-small-aaa", "status": "suspending"}
+    assert client.actions == [("suspend", "jl-small-aaa")]
+    assert TOKEN not in resp.body.decode()
+
+
+async def test_resume_cluster_maps_to_resume_op(jp_fetch, patch_client):
+    client = patch_client(FakeClient())
+    resp = await jp_fetch("bifrost", "clusters", "jl-small-aaa", "resume", method="POST", body="")
+    assert resp.code == 200
+    payload = json.loads(resp.body)
+    assert payload == {"id": "jl-small-aaa", "status": "resuming"}
+    assert client.actions == [("resume", "jl-small-aaa")]
+
+
+async def test_suspend_cluster_maps_conflict(jp_fetch, patch_client):
+    patch_client(FakeClient(action_error=BifrostAPIError(409, "conflict")))
+    with pytest.raises(HTTPClientError) as exc:
+        await jp_fetch("bifrost", "clusters", "jl-x", "suspend", method="POST", body="")
+    assert exc.value.code == 409
+    assert json.loads(exc.value.response.body)["error"] == "conflict"
+
+
+async def test_resume_cluster_unconfigured_is_clean_409(jp_fetch, monkeypatch):
+    def boom():
+        raise BifrostConfigError("no token")
+
+    monkeypatch.setattr(handlers, "client_from_env", boom)
+    with pytest.raises(HTTPClientError) as exc:
+        await jp_fetch("bifrost", "clusters", "jl-x", "resume", method="POST", body="")
+    assert exc.value.code == 409
+    assert json.loads(exc.value.response.body)["error"] == "bifrost not configured"
+
+
+async def test_lifecycle_rejects_unknown_action(jp_fetch, patch_client):
+    # Only suspend|resume are routed to the lifecycle handler; any other verb on
+    # /clusters/{id}/{action} is not a registered route → 404 (never a 500).
+    client = patch_client(FakeClient())
+    with pytest.raises(HTTPClientError) as exc:
+        await jp_fetch("bifrost", "clusters", "jl-x", "obliterate", method="POST", body="")
+    assert exc.value.code == 404
+    assert client.actions == []
 
 
 async def test_get_address_makes_no_backend_call(jp_fetch, monkeypatch):

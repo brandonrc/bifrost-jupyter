@@ -87,8 +87,26 @@ class BifrostClient:
             raise _translate(exc) from None
 
     def delete_cluster(self, cluster_id: str) -> None:
+        # Wraps Bifrost's project-scoped ``DELETE /api/v1/clusters/{id}`` (Write);
+        # stops (tears down) the cluster. 202-style async on the Bifrost side.
         try:
             self._clusters.delete_cluster(cluster_id)
+        except ApiException as exc:
+            raise _translate(exc) from None
+
+    def suspend_cluster(self, cluster_id: str) -> None:
+        # Wraps Bifrost's project-scoped ``POST /api/v1/clusters/{id}/suspend``
+        # (Write) — scales the cluster to zero while keeping its record.
+        try:
+            self._clusters.suspend_cluster(cluster_id)
+        except ApiException as exc:
+            raise _translate(exc) from None
+
+    def resume_cluster(self, cluster_id: str) -> None:
+        # Wraps Bifrost's project-scoped ``POST /api/v1/clusters/{id}/resume``
+        # (Write) — brings a suspended cluster back up.
+        try:
+            self._clusters.resume_cluster(cluster_id)
         except ApiException as exc:
             raise _translate(exc) from None
 

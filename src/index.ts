@@ -3,6 +3,8 @@ import {
   JupyterFrontEndPlugin
 } from '@jupyterlab/application';
 
+import { INotebookTracker } from '@jupyterlab/notebook';
+
 import { ITranslator } from '@jupyterlab/translation';
 
 import { BifrostPanel } from './BifrostPanel';
@@ -19,10 +21,16 @@ const plugin: JupyterFrontEndPlugin<void> = {
   description:
     'JupyterLab extension to start, stop, and connect to Bifrost-fronted Ray clusters',
   autoStart: true,
+  requires: [INotebookTracker],
   optional: [ITranslator],
-  activate: (app: JupyterFrontEnd, translator: ITranslator | null) => {
+  activate: (
+    app: JupyterFrontEnd,
+    notebooks: INotebookTracker,
+    translator: ITranslator | null
+  ) => {
     const panel = new BifrostPanel(
       app.serviceManager.serverSettings,
+      notebooks,
       translator ?? undefined
     );
     app.shell.add(panel, 'left', { rank: 200 });

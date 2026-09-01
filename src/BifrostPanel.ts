@@ -1,3 +1,9 @@
+import {
+  INotebookTracker,
+  NotebookActions,
+  NotebookPanel
+} from '@jupyterlab/notebook';
+
 import { ServerConnection } from '@jupyterlab/services';
 
 import {
@@ -12,10 +18,14 @@ import { Widget } from '@lumino/widgets';
 
 import {
   createCluster,
+  getAddress,
   ICluster,
   IProfileView,
   listClusters,
-  listProfiles
+  listProfiles,
+  resumeCluster,
+  stopCluster,
+  suspendCluster
 } from './api';
 
 /** How often the status list re-polls ``GET /bifrost/clusters`` (ms). */
@@ -31,6 +41,7 @@ const POLL_INTERVAL_MS = 5000;
  */
 export class BifrostPanel extends Widget {
   private _serverSettings: ServerConnection.ISettings;
+  private _notebooks: INotebookTracker | undefined;
   private _trans: TranslationBundle;
   private _select: HTMLSelectElement;
   private _startButton: HTMLButtonElement;
@@ -42,10 +53,12 @@ export class BifrostPanel extends Widget {
 
   constructor(
     serverSettings: ServerConnection.ISettings,
+    notebooks?: INotebookTracker,
     translator?: ITranslator
   ) {
     super();
     this._serverSettings = serverSettings;
+    this._notebooks = notebooks;
     this._trans = (translator ?? nullTranslator).load('bifrost-jupyter');
     const trans = this._trans;
 
@@ -256,7 +269,149 @@ export class BifrostPanel extends Widget {
 
       item.appendChild(id);
       item.appendChild(state);
+      item.appendChild(this._clusterActions(cluster));
       this._statusList.appendChild(item);
+    }
+  }
+
+  /**
+   * The per-cluster action buttons, gated on the cluster's coarse state:
+   * Connect + Suspend when running, Resume when suspended, and Stop always
+   * (Stop is destructive and confirms first).
+   */
+  private _clusterActions(cluster: ICluster): HTMLDivElement {
+    const actions = document.createElement('div');
+    actions.className = 'jp-BifrostPanel-actions';
+
+    const running = cluster.state === 'running';
+    const suspended = cluster.state === 'suspended';
+
+    if (running) {
+      actions.appendChild(
+        this._actionButton(
+          this._trans.__('Connect'),
+          'jp-BifrostPanel-connect',
+          () => this._onConnect(cluster.id)
+        )
+      );
+      actions.appendChild(
+        this._actionButton(
+          this._trans.__('Suspend'),
+          'jp-BifrostPanel-suspend',
+          () => this._onSuspend(cluster.id)
+        )
+      );
+    }
+    if (suspended) {
+      actions.appendChild(
+        this._actionButton(
+          this._trans.__('Resume'),
+          'jp-BifrostPanel-resume',
+          () => this._onResume(cluster.id)
+        )
+      );
+    }
+    actions.appendChild(
+      this._actionButton(this._trans.__('Stop'), 'jp-BifrostPanel-stop', () =>
+        this._onStop(cluster.id)
+      )
+    );
+
+    return actions;
+  }
+
+  /** Build one action button; ``label`` is already translated by the caller. */
+  private _actionButton(
+    label: string,
+    className: string,
+    onClick: () => void
+  ): HTMLButtonElement {
+    const button = document.createElement('button');
+    button.className = `${className} jp-mod-styled`;
+    button.textContent = label;
+    button.addEventListener('click', onClick);
+    return button;
+  }
+
+  /** Stop is destructive: confirm, then ``DELETE /bifrost/clusters/{id}``. */
+  private async _onStop(id: string): Promise<void> {
+    const confirmed = window.confirm(
+      this._trans.__(
+        'Stop cluster "%1"? This tears it down and cannot be undone.',
+        id
+      )
+    );
+    if (!confirmed) {
+      return;
+    }
+    this._showMessage(this._trans.__('Stopping %1…', id), false);
+    try {
+      await stopCluster(this._serverSettings, id);
+      await this._refreshStatus();
+      this._showMessage(this._trans.__('Stopping %1.', id), false);
+    } catch (error) {
+      this._showMessage(
+        this._trans.__('Stop failed: %1', errorText(error)),
+        true
+      );
+    }
+  }
+
+  private async _onSuspend(id: string): Promise<void> {
+    this._showMessage(this._trans.__('Suspending %1…', id), false);
+    try {
+      await suspendCluster(this._serverSettings, id);
+      await this._refreshStatus();
+    } catch (error) {
+      this._showMessage(
+        this._trans.__('Suspend failed: %1', errorText(error)),
+        true
+      );
+    }
+  }
+
+  private async _onResume(id: string): Promise<void> {
+    this._showMessage(this._trans.__('Resuming %1…', id), false);
+    try {
+      await resumeCluster(this._serverSettings, id);
+      await this._refreshStatus();
+    } catch (error) {
+      this._showMessage(
+        this._trans.__('Resume failed: %1', errorText(error)),
+        true
+      );
+    }
+  }
+
+  /**
+   * "Connect" (#6): fetch the in-cluster Jobs address and inject a ready-to-run
+   * ``JobSubmissionClient`` cell into the active notebook. Needs an open
+   * notebook; otherwise it prompts the user to open one.
+   */
+  private async _onConnect(id: string): Promise<void> {
+    const current = this._notebooks?.currentWidget;
+    if (!current) {
+      this._showMessage(
+        this._trans.__('Open a notebook first to add a Connect cell.'),
+        true
+      );
+      return;
+    }
+    try {
+      const address = await getAddress(this._serverSettings, id);
+      insertConnectCell(current, address.snippet);
+      this._showMessage(
+        this._trans.__(
+          'Added a Connect cell for %1 to the active notebook.',
+          id
+        ),
+        false
+      );
+    } catch (error) {
+      this._showMessage(
+        this._trans.__('Connect failed: %1', errorText(error)),
+        true
+      );
     }
   }
 
@@ -292,6 +447,20 @@ export class BifrostPanel extends Widget {
     this._messageBar.hidden = false;
     this._messageBar.textContent = message;
     this._messageBar.classList.toggle('jp-mod-error', isError);
+  }
+}
+
+/**
+ * Insert a runnable code cell carrying ``source`` below the active cell of the
+ * given notebook and make it active, using the JupyterLab notebook API. The
+ * cell is inserted but not executed — the user runs it when ready.
+ */
+function insertConnectCell(panel: NotebookPanel, source: string): void {
+  const notebook = panel.content;
+  NotebookActions.insertBelow(notebook);
+  const cell = notebook.activeCell;
+  if (cell) {
+    cell.model.sharedModel.setSource(source);
   }
 }
 
