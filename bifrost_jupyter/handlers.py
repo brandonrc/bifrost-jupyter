@@ -45,12 +45,35 @@ class ProfilesHandler(_BifrostHandler):
         self.finish(json.dumps({"profiles": [v.to_dict() for v in views]}))
 
 
-class ClustersHandler(_BifrostHandler):
-    """``POST /bifrost/clusters`` — start a cluster from an approved profile.
+def _observed_state(view) -> str:
+    """The coarse, safe state for a cluster view: observed, else desired."""
+    return view.observed_state or view.desired or "pending"
 
-    The body carries only a profile *name* (``{"profile": <name>}``); no field
-    maps to a raw spec, so the allowlist is the only path to a ``ClusterSpec``.
+
+class ClustersHandler(_BifrostHandler):
+    """``/bifrost/clusters`` — list clusters (GET) and start one (POST).
+
+    ``POST`` body carries only a profile *name* (``{"profile": <name>}``); no
+    field maps to a raw spec, so the allowlist is the only path to a
+    ``ClusterSpec``. ``GET`` returns the project-scoped list/status view.
     """
+
+    @tornado.web.authenticated
+    def get(self) -> None:
+        try:
+            client = self._client()
+        except BifrostConfigError:
+            self._fail(500, "bifrost extension is not configured")
+            return
+
+        try:
+            views = client.list_clusters()
+        except BifrostAPIError as exc:
+            self._fail(exc.status, exc.message)
+            return
+
+        clusters = [{"id": v.id, "state": _observed_state(v)} for v in views]
+        self.finish(json.dumps({"clusters": clusters}))
 
     @tornado.web.authenticated
     def post(self) -> None:
@@ -87,8 +110,7 @@ class ClustersHandler(_BifrostHandler):
             self._fail(exc.status, exc.message)
             return
 
-        status = view.observed_state or view.desired or "pending"
-        self.finish(json.dumps({"id": body.id, "status": status}))
+        self.finish(json.dumps({"id": body.id, "status": _observed_state(view)}))
 
 
 class ClusterAddressHandler(_BifrostHandler):
