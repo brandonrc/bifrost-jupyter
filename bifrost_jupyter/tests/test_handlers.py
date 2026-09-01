@@ -26,7 +26,7 @@ from bifrost_jupyter.bifrost import BifrostAPIError, BifrostConfigError
 from bifrost_jupyter.tests import ROUTE_SSRF_IDS
 from bifrost_jupyter.tests.test_credentials import make_jwt
 
-TOKEN = "mob_supersecrettoken"
+TOKEN = "bfr_supersecrettoken"
 
 
 class FakeClient:

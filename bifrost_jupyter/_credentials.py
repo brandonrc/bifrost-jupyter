@@ -32,7 +32,7 @@ Precedence, highest first
    nothing and only validates the result.
 4. Optionally (opt-in, **off by default** — see below) a longer-lived Bifrost
    PAT minted once per session via ``POST /api/v1/auth/tokens``.
-5. **Dev fallback**: a pasted ``mob_`` PAT in ``BIFROST_TOKEN``.
+5. **Dev fallback**: a pasted ``bfr_`` PAT in ``BIFROST_TOKEN``.
 
 OIDC beats the dev PAT: if both are present the OIDC identity wins, because it
 is the identity that must match the pod's owner label (see the README).
@@ -112,7 +112,7 @@ OIDC_SCOPE_ENV_VAR = "BIFROST_OIDC_SCOPE"
 MINT_PAT_ENV_VAR = "BIFROST_MINT_PAT"
 PAT_TTL_DAYS_ENV_VAR = "BIFROST_PAT_TTL_DAYS"
 
-#: Dev / non-Hub fallback: a pasted ``mob_`` PAT.
+#: Dev / non-Hub fallback: a pasted ``bfr_`` PAT.
 TOKEN_ENV_VAR = "BIFROST_TOKEN"
 
 #: RFC 8693 constants, matching ``internal/auth/flows.go``.
@@ -332,7 +332,7 @@ def jwt_expiry(token: str) -> float | None:
     """The ``exp`` claim of a JWT, without verifying anything.
 
     Signature/issuer/audience validation is Bifrost's job — this only needs to
-    know *when to refresh*, and a token we cannot parse (a ``mob_`` PAT, say)
+    know *when to refresh*, and a token we cannot parse (a ``bfr_`` PAT, say)
     simply has no locally known expiry.
     """
     parts = token.split(".")

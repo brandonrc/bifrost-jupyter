@@ -26,7 +26,7 @@ from bifrost_jupyter._apiclient import BoundedApiClient
 
 API_URL = "https://bifrost.example"
 TOKEN_URL = "https://keycloak.example/realms/nebari/protocol/openid-connect/token"
-DEV_PAT = "mob_devpatsupersecret"
+DEV_PAT = "bfr_devpatsupersecret"
 
 
 def make_jwt(exp: float | None, sub: str = "8f14e45f-ceea-467a", username: str = "alice") -> str:
@@ -79,7 +79,7 @@ def fake_auth_api(monkeypatch):
 
     state = SimpleNamespace(
         calls=[],
-        response=SimpleNamespace(token="mob_minted", prefix="mob_min", expires_at=0),
+        response=SimpleNamespace(token="bfr_minted", prefix="bfr_min", expires_at=0),
         error=None,
     )
 
@@ -350,12 +350,12 @@ def test_pat_mint_when_enabled_uses_the_oidc_bearer(monkeypatch, fake_auth_api):
     monkeypatch.setenv(_credentials.MINT_PAT_ENV_VAR, "1")
     expires_at = time.time() + 86_400
     fake_auth_api.response = SimpleNamespace(
-        token="mob_minted", prefix="mob_min", expires_at=expires_at
+        token="bfr_minted", prefix="bfr_min", expires_at=expires_at
     )
 
     credential = _credentials.CredentialResolver(API_URL).credential()
 
-    assert credential.token == "mob_minted"
+    assert credential.token == "bfr_minted"
     assert credential.source == _credentials.SOURCE_MINTED_PAT
     assert credential.expires_at == expires_at
     (call,) = fake_auth_api.calls
@@ -415,7 +415,7 @@ def test_credential_cannot_be_dumped_field_by_field():
     fields instead and would hand back the plaintext. ``Credential`` is therefore
     not a dataclass and has no instance ``__dict__``, so every one of them fails
     rather than quietly succeeding in some future debug handler."""
-    credential = _credentials.Credential("mob_supersecret", "dev-pat", None)
+    credential = _credentials.Credential("bfr_supersecret", "dev-pat", None)
 
     assert not dataclasses.is_dataclass(credential)
     with pytest.raises(TypeError):
@@ -426,26 +426,26 @@ def test_credential_cannot_be_dumped_field_by_field():
         vars(credential)
     assert not hasattr(credential, "__dict__")
     # And the one deliberate way out still works.
-    assert credential.token == "mob_supersecret"
+    assert credential.token == "bfr_supersecret"
 
 
 def test_static_credential_cannot_be_dumped_field_by_field():
-    source = _credentials.StaticCredential("mob_supersecret")
+    source = _credentials.StaticCredential("bfr_supersecret")
     assert not dataclasses.is_dataclass(source)
     with pytest.raises(TypeError):
         vars(source)
 
 
 def test_credential_redacts_itself_in_repr_and_str():
-    credential = _credentials.Credential("mob_supersecret", "dev-pat", None)
-    assert "mob_supersecret" not in repr(credential)
-    assert "mob_supersecret" not in str(credential)
-    assert "mob_supersecret" not in f"{credential}"
+    credential = _credentials.Credential("bfr_supersecret", "dev-pat", None)
+    assert "bfr_supersecret" not in repr(credential)
+    assert "bfr_supersecret" not in str(credential)
+    assert "bfr_supersecret" not in f"{credential}"
     assert "REDACTED" in repr(credential)
 
 
 def test_static_credential_redacts_itself():
-    assert "mob_supersecret" not in repr(_credentials.StaticCredential("mob_supersecret"))
+    assert "bfr_supersecret" not in repr(_credentials.StaticCredential("bfr_supersecret"))
 
 
 def test_resolution_logs_the_source_but_not_the_token(monkeypatch, caplog):
@@ -474,12 +474,12 @@ def test_session_resolver_resolves_once_per_session(monkeypatch, fake_auth_api):
     monkeypatch.setenv(_credentials.OIDC_TOKEN_ENV_VAR, make_jwt(time.time() + 3600))
     monkeypatch.setenv(_credentials.MINT_PAT_ENV_VAR, "1")
     fake_auth_api.response = SimpleNamespace(
-        token="mob_minted", prefix="mob_min", expires_at=time.time() + 86_400
+        token="bfr_minted", prefix="bfr_min", expires_at=time.time() + 86_400
     )
 
     resolver = _credentials.session_resolver(API_URL)
     for _ in range(5):
-        assert resolver.get() == "mob_minted"
+        assert resolver.get() == "bfr_minted"
     assert len(fake_auth_api.calls) == 1
 
 
@@ -534,7 +534,7 @@ def test_concurrent_resolution_resolves_once(monkeypatch):
             mints.append(time.monotonic())
             time.sleep(0.05)
             return SimpleNamespace(
-                token="mob_minted", prefix="mob_min", expires_at=time.time() + 86_400
+                token="bfr_minted", prefix="bfr_min", expires_at=time.time() + 86_400
             )
 
     monkeypatch.setattr(_credentials, "AuthApi", SlowMintApi)
@@ -553,7 +553,7 @@ def test_concurrent_resolution_resolves_once(monkeypatch):
         w.join(timeout=10)
 
     assert not errors, errors
-    assert results == ["mob_minted"] * threads
+    assert results == ["bfr_minted"] * threads
     assert len(mints) == 1, f"{len(mints)} concurrent mints — the resolver is not locked"
 
 
@@ -563,8 +563,8 @@ def test_concurrent_resolution_resolves_once(monkeypatch):
 @pytest.mark.parametrize(
     "make",
     [
-        lambda: _credentials.Credential("mob_supersecret", "dev-pat", None),
-        lambda: _credentials.StaticCredential("mob_supersecret"),
+        lambda: _credentials.Credential("bfr_supersecret", "dev-pat", None),
+        lambda: _credentials.StaticCredential("bfr_supersecret"),
     ],
     ids=["Credential", "StaticCredential"],
 )
@@ -591,6 +591,6 @@ def test_credentials_refuse_pickle_and_copy(make):
 def test_pickling_a_container_holding_a_credential_also_fails():
     """The realistic shape of the leak: nobody pickles a Credential directly,
     they pickle a dict or a cache that happens to hold one."""
-    payload = {"session": {"credential": _credentials.Credential("mob_supersecret", "oidc", None)}}
+    payload = {"session": {"credential": _credentials.Credential("bfr_supersecret", "oidc", None)}}
     with pytest.raises(TypeError):
         pickle.dumps(payload)

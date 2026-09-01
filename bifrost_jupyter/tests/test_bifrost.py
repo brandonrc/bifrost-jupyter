@@ -13,7 +13,7 @@ from bifrost_jupyter._profiles import build_create_cluster
 from bifrost_jupyter.tests.test_credentials import make_jwt
 
 API_URL = "https://bifrost.example"
-TOKEN = "mob_supersecrettoken"
+TOKEN = "bfr_supersecrettoken"
 
 
 def test_credential_is_attached_to_outbound_config():

@@ -36,7 +36,7 @@ Highest first. The first one that resolves wins:
 | 2   | …renewed at the IdP when it has expired (`grant_type=refresh_token`)     | `BIFROST_OIDC_REFRESH_TOKEN_FILE` / `BIFROST_OIDC_REFRESH_TOKEN` + `BIFROST_OIDC_TOKEN_URL`                                                 |
 | 3   | …exchanged for a Bifrost-audience token (RFC 8693) when audiences differ | `BIFROST_OIDC_AUDIENCE` (+ `BIFROST_OIDC_TOKEN_URL`, `BIFROST_OIDC_CLIENT_ID`, `BIFROST_OIDC_CLIENT_SECRET`, optional `BIFROST_OIDC_SCOPE`) |
 | 4   | …traded once per session for a Bifrost PAT — **opt-in, off by default**  | `BIFROST_MINT_PAT=1` (+ `BIFROST_PAT_TTL_DAYS`, default 1, capped at Bifrost's 90)                                                          |
-| 5   | Dev / non-Hub fallback: a pasted `mob_` PAT                              | `BIFROST_TOKEN`                                                                                                                             |
+| 5   | Dev / non-Hub fallback: a pasted `bfr_` PAT                              | `BIFROST_TOKEN`                                                                                                                             |
 
 Plus `BIFROST_API_URL`, the Bifrost control-plane base URL, which is required in
 every case. With none of the credential variables set the extension reports
@@ -122,7 +122,7 @@ If they diverge, the failure is quiet and confusing: the control plane still
 works (clusters start, stop and list normally) while every in-cluster call —
 job submit, job status, the dashboard — times out or is refused, because the
 NetworkPolicy is keyed on an owner the pod does not carry. With the dev
-`mob_` PAT this is the expected state whenever the PAT's subject is not the
+`bfr_` PAT this is the expected state whenever the PAT's subject is not the
 notebook user.
 
 ### Why the session PAT mint is opt-in
