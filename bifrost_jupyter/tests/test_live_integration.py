@@ -27,7 +27,7 @@ pytestmark = pytest.mark.skipif(
 
 
 async def test_live_post_clusters(jp_fetch):
-    resp = await jp_fetch("bifrost", "clusters", method="POST", body="{}")
+    resp = await jp_fetch("bifrost", "clusters", method="POST", body='{"profile": "small"}')
     assert resp.code == 200
     payload = json.loads(resp.body)
     assert payload["id"]

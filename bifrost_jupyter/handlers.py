@@ -31,9 +31,26 @@ class _BifrostHandler(APIHandler):
         # Raises BifrostConfigError if env is not configured; caught by callers.
         return client_from_env()
 
+    def _allowlist(self):
+        # Resolved at extension load; defaults to the built-in set if unset.
+        return self.settings.get("bifrost_profiles") or _profiles.DEFAULT_PROFILES
+
+
+class ProfilesHandler(_BifrostHandler):
+    """``GET /bifrost/profiles`` — the safe allowlist view (no manifest surface)."""
+
+    @tornado.web.authenticated
+    def get(self) -> None:
+        views = _profiles.list_profiles(self._allowlist())
+        self.finish(json.dumps({"profiles": [v.to_dict() for v in views]}))
+
 
 class ClustersHandler(_BifrostHandler):
-    """``POST /bifrost/clusters`` — start a cluster from the ``small`` profile."""
+    """``POST /bifrost/clusters`` — start a cluster from an approved profile.
+
+    The body carries only a profile *name* (``{"profile": <name>}``); no field
+    maps to a raw spec, so the allowlist is the only path to a ``ClusterSpec``.
+    """
 
     @tornado.web.authenticated
     def post(self) -> None:
@@ -43,7 +60,26 @@ class ClustersHandler(_BifrostHandler):
             self._fail(500, "bifrost extension is not configured")
             return
 
-        body = _profiles.build_create_cluster(_profiles.SMALL)
+        try:
+            payload = json.loads(self.request.body or b"{}")
+        except json.JSONDecodeError:
+            self._fail(400, "invalid request body")
+            return
+        if not isinstance(payload, dict):
+            self._fail(400, "invalid request body")
+            return
+
+        name = payload.get("profile")
+        if not name:
+            self._fail(400, "missing 'profile'")
+            return
+
+        try:
+            body = _profiles.profile_to_spec(name, self._allowlist())
+        except _profiles.UnknownProfileError as exc:
+            self._fail(400, str(exc))
+            return
+
         try:
             client.create_cluster(body)
             view = client.get_cluster(body.id)
@@ -77,17 +113,20 @@ class ClusterAddressHandler(_BifrostHandler):
         )
 
 
-def setup_handlers(web_app, namespace: str | None = None) -> None:
+def setup_handlers(web_app, namespace: str | None = None, profiles=None) -> None:
     host_pattern = ".*$"
     base_url = web_app.settings["base_url"]
     web_app.settings["bifrost_cluster_namespace"] = namespace or default_namespace()
+    web_app.settings["bifrost_profiles"] = profiles or _profiles.DEFAULT_PROFILES
 
+    profiles_url = url_path_join(base_url, "bifrost", "profiles")
     clusters = url_path_join(base_url, "bifrost", "clusters")
     address = url_path_join(base_url, "bifrost", "clusters", r"([^/]+)", "address")
 
     web_app.add_handlers(
         host_pattern,
         [
+            (profiles_url, ProfilesHandler),
             (clusters, ClustersHandler),
             (address, ClusterAddressHandler),
         ],

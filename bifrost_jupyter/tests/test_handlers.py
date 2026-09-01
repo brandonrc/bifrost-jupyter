@@ -44,7 +44,7 @@ async def test_post_clusters_returns_id_and_status(jp_fetch, patch_client):
     view = SimpleNamespace(observed_state="running", desired="running")
     client = patch_client(FakeClient(view=view))
 
-    resp = await jp_fetch("bifrost", "clusters", method="POST", body="{}")
+    resp = await jp_fetch("bifrost", "clusters", method="POST", body='{"profile": "small"}')
     assert resp.code == 200
     payload = json.loads(resp.body)
 
@@ -57,14 +57,14 @@ async def test_post_clusters_returns_id_and_status(jp_fetch, patch_client):
 async def test_post_clusters_falls_back_to_desired_state(jp_fetch, patch_client):
     view = SimpleNamespace(observed_state=None, desired="running")
     patch_client(FakeClient(view=view))
-    resp = await jp_fetch("bifrost", "clusters", method="POST", body="{}")
+    resp = await jp_fetch("bifrost", "clusters", method="POST", body='{"profile": "small"}')
     assert json.loads(resp.body)["status"] == "running"
 
 
 async def test_post_clusters_maps_conflict(jp_fetch, patch_client):
     patch_client(FakeClient(create_error=BifrostAPIError(409, "conflict")))
     with pytest.raises(HTTPClientError) as exc:
-        await jp_fetch("bifrost", "clusters", method="POST", body="{}")
+        await jp_fetch("bifrost", "clusters", method="POST", body='{"profile": "small"}')
     assert exc.value.code == 409
     assert json.loads(exc.value.response.body)["error"] == "conflict"
 
@@ -75,9 +75,59 @@ async def test_post_clusters_config_error(jp_fetch, monkeypatch):
 
     monkeypatch.setattr(handlers, "client_from_env", boom)
     with pytest.raises(HTTPClientError) as exc:
-        await jp_fetch("bifrost", "clusters", method="POST", body="{}")
+        await jp_fetch("bifrost", "clusters", method="POST", body='{"profile": "small"}')
     assert exc.value.code == 500
     assert json.loads(exc.value.response.body)["error"] == "bifrost extension is not configured"
+
+
+async def test_post_clusters_missing_profile_is_rejected(jp_fetch, patch_client):
+    # A body with no profile name must not silently default to a shape.
+    patch_client(FakeClient(view=SimpleNamespace(observed_state="running", desired="running")))
+    with pytest.raises(HTTPClientError) as exc:
+        await jp_fetch("bifrost", "clusters", method="POST", body="{}")
+    assert exc.value.code == 400
+    assert json.loads(exc.value.response.body)["error"] == "missing 'profile'"
+
+
+async def test_post_clusters_unknown_profile_is_rejected(jp_fetch, patch_client):
+    # An unknown name is a clear 400 error, never a fallback to a default.
+    client = patch_client(FakeClient(view=SimpleNamespace(observed_state="running", desired="x")))
+    with pytest.raises(HTTPClientError) as exc:
+        await jp_fetch("bifrost", "clusters", method="POST", body='{"profile": "enormous"}')
+    assert exc.value.code == 400
+    assert "unknown profile" in json.loads(exc.value.response.body)["error"]
+    assert client.created is None  # no cluster was created
+
+
+async def test_post_clusters_rejects_raw_spec_passthrough(jp_fetch, patch_client):
+    # Extra body fields (an attempt to inject a raw spec) are ignored; only the
+    # profile name selects the shape, which comes entirely from the allowlist.
+    client = patch_client(FakeClient(view=SimpleNamespace(observed_state="running", desired="x")))
+    body = json.dumps(
+        {"profile": "small", "image": "evil:latest", "head_cpu": "64", "owner": "attacker"}
+    )
+    resp = await jp_fetch("bifrost", "clusters", method="POST", body=body)
+    assert resp.code == 200
+    created = client.created
+    assert created.spec.image == "rayproject/ray:2.9.0"  # from the profile, not the body
+    assert created.spec.head_cpu == "1"  # from the profile, not the body
+    assert created.spec.owner is None  # never accepted from the client
+
+
+async def test_get_profiles_returns_safe_view(jp_fetch):
+    resp = await jp_fetch("bifrost", "profiles")
+    assert resp.code == 200
+    body = resp.body.decode()
+    payload = json.loads(body)
+
+    names = {p["name"] for p in payload["profiles"]}
+    assert {"small", "medium", "gpu"} <= names
+    # The safe view carries the coarse shape but never a raw manifest surface.
+    for p in payload["profiles"]:
+        assert "description" in p and "head_cpu" in p
+        assert "image" not in p
+        assert "ray_version" not in p
+    assert "rayproject/ray" not in body  # image string never leaks
 
 
 async def test_get_address_returns_in_cluster_snippet(jp_fetch):
