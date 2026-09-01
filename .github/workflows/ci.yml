@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: main
+  pull_request:
+    branches: '*'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python (ruff + mypy + pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install the extension (+ test/lint extras)
+        # Installs bifrost_client from its GitHub release-asset URL (needs network
+        # to github releases, available on GitHub Actions runners) and builds the
+        # labextension via hatch-jupyter-builder.
+        run: |
+          set -eux
+          python -m pip install -U pip "jupyterlab>=4.0.0,<5"
+          python -m pip install .[test,lint]
+
+      - name: Ruff
+        run: ruff check .
+
+      - name: Mypy
+        run: mypy
+
+      - name: Pytest
+        run: pytest -vv -r ap --cov bifrost_jupyter
+
+  frontend:
+    name: TypeScript (eslint + tsc + jest + build)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Base Setup
+        uses: jupyterlab/maintainer-tools/.github/actions/base-setup@v1
+
+      - name: Install dependencies
+        run: |
+          set -eux
+          python -m pip install -U "jupyterlab>=4.0.0,<5"
+          jlpm install
+
+      - name: ESLint
+        run: jlpm run eslint:check
+
+      - name: TypeScript compile
+        run: jlpm run build:lib:prod
+
+      - name: Jest
+        run: jlpm run test
+
+      - name: Build labextension
+        run: jlpm run build:prod
+
+  install-smoke:
+    name: Install smoke (both extensions register)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Base Setup
+        uses: jupyterlab/maintainer-tools/.github/actions/base-setup@v1
+
+      - name: Install dependencies
+        run: python -m pip install -U "jupyterlab>=4.0.0,<5"
+
+      - name: Editable install
+        run: |
+          set -eux
+          python -m pip install -e .
+
+      - name: Assert labextension is registered
+        run: |
+          set -eux
+          jupyter labextension list
+          jupyter labextension list 2>&1 | grep -ie "bifrost-jupyter.*OK"
+
+      - name: Assert server extension is registered
+        run: |
+          set -eux
+          jupyter server extension list
+          jupyter server extension list 2>&1 | grep -ie "bifrost_jupyter.*OK"

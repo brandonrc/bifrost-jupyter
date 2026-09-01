@@ -1,0 +1,17 @@
+# Changes here will be overwritten by Copier; NEVER EDIT MANUALLY
+_commit: v4.6.5
+_src_path: https://github.com/jupyterlab/extension-template
+advanced: false
+author_email: brandon.geraci@gmail.com
+author_name: Brandon Geraci
+has_ai_rules: false
+has_binder: false
+has_settings: false
+kind: frontend-and-server
+labextension_name: bifrost-jupyter
+project_short_description: JupyterLab extension to start, stop, and connect to Bifrost-fronted
+    Ray clusters
+python_name: bifrost_jupyter
+repository: https://github.com/brandonrc/bifrost-jupyter
+test: true
+
