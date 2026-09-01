@@ -1,16 +1,22 @@
-"""Server route tests: /bifrost/clusters and /bifrost/clusters/{id}/address.
+"""Server route tests for the ``/bifrost/*`` routes.
 
-The Bifrost client is faked; these assert the request/response contract and that
-the credential never appears in a response body.
+Covers ``/bifrost/clusters`` (+ lifecycle), ``/clusters/{id}/address`` and the
+Ray Jobs routes ``/clusters/{id}/jobs[/{job_id}]``.
+
+The Bifrost client is faked for control-plane routes; these assert the
+request/response contract and that the credential never appears in a response
+body. The jobs routes talk to the cluster's Ray head service instead of Bifrost,
+so there it is tornado's ``AsyncHTTPClient`` that is faked.
 """
 
+import io
 import json
 from types import SimpleNamespace
 
 import pytest
-from tornado.httpclient import HTTPClientError
+from tornado.httpclient import HTTPClientError, HTTPResponse
 
-from bifrost_jupyter import handlers
+from bifrost_jupyter import _jobs, handlers
 from bifrost_jupyter.bifrost import BifrostAPIError, BifrostConfigError
 
 TOKEN = "mob_supersecrettoken"
@@ -343,3 +349,254 @@ async def test_get_address_makes_no_backend_call(jp_fetch, monkeypatch):
     resp = await jp_fetch("bifrost", "clusters", "cl-xyz", "address")
     assert resp.code == 200
     assert json.loads(resp.body)["jobs_address"] == "http://cl-xyz-head-svc.bifrost.svc:8265"
+
+
+# --- Ray Jobs routes (requirement #11: env vars -> runtime_env.env_vars) -------
+#
+# These routes talk to the cluster's own Ray head service, not Bifrost, so the
+# HTTP layer (tornado's AsyncHTTPClient inside ``_jobs``) is what gets faked.
+
+
+class FakeRayServer:
+    """Stands in for ``_jobs.AsyncHTTPClient``; records the requests it is sent."""
+
+    def __init__(self, *, body=None, error=None, raises=None):
+        self.requests = []
+        self._body = body if body is not None else {}
+        self._error = error
+        self._raises = raises
+
+    def __call__(self):  # AsyncHTTPClient() -> this recorder
+        return self
+
+    async def fetch(self, request):
+        self.requests.append(request)
+        if self._raises is not None:
+            raise self._raises
+        if self._error is not None:
+            raise self._error
+        return HTTPResponse(request, 200, buffer=io.BytesIO(json.dumps(self._body).encode()))
+
+
+@pytest.fixture
+def ray_server(monkeypatch):
+    def _install(**kwargs):
+        server = FakeRayServer(**kwargs)
+        monkeypatch.setattr(_jobs, "AsyncHTTPClient", server)
+        return server
+
+    return _install
+
+
+async def test_post_job_puts_env_vars_in_runtime_env(jp_fetch, ray_server):
+    server = ray_server(body={"job_id": "raysubmit_legacy", "submission_id": "raysubmit_abc"})
+
+    body = json.dumps(
+        {"entrypoint": "python train.py", "env_vars": {"HF_TOKEN": "t", "SEED": "7"}}
+    )
+    resp = await jp_fetch("bifrost", "clusters", "cl-1", "jobs", method="POST", body=body)
+    assert resp.code == 200
+
+    # The submission id Ray keys later calls on is ``submission_id``.
+    assert json.loads(resp.body) == {
+        "job_id": "raysubmit_abc",
+        "submission_id": "raysubmit_abc",
+    }
+
+    # Exactly one call, to the in-cluster head service's Jobs API (trailing slash).
+    assert len(server.requests) == 1
+    request = server.requests[0]
+    assert request.url == "http://cl-1-head-svc.bifrost.svc:8265/api/jobs/"
+    assert request.method == "POST"
+
+    # This is requirement #11: env vars land under runtime_env.env_vars.
+    sent = json.loads(request.body)
+    assert sent == {
+        "entrypoint": "python train.py",
+        "runtime_env": {"env_vars": {"HF_TOKEN": "t", "SEED": "7"}},
+    }
+
+
+async def test_post_job_without_env_vars_still_sends_runtime_env(jp_fetch, ray_server):
+    server = ray_server(body={"submission_id": "raysubmit_abc"})
+    await jp_fetch(
+        "bifrost", "clusters", "cl-1", "jobs", method="POST", body='{"entrypoint": "echo hi"}'
+    )
+    sent = json.loads(server.requests[0].body)
+    assert sent == {"entrypoint": "echo hi", "runtime_env": {"env_vars": {}}}
+
+
+async def test_post_job_carries_no_authorization_header(jp_fetch, ray_server):
+    # The in-cluster path is gated by the per-owner NetworkPolicy, not a token:
+    # the Bifrost credential must never be attached here.
+    server = ray_server(body={"submission_id": "raysubmit_abc"})
+    await jp_fetch(
+        "bifrost", "clusters", "cl-1", "jobs", method="POST", body='{"entrypoint": "echo hi"}'
+    )
+    headers = {k.lower() for k in server.requests[0].headers}
+    assert "authorization" not in headers
+
+
+async def test_post_job_falls_back_to_legacy_job_id(jp_fetch, ray_server):
+    # Older Ray job servers answer with only the deprecated ``job_id`` field.
+    ray_server(body={"job_id": "raysubmit_old"})
+    resp = await jp_fetch(
+        "bifrost", "clusters", "cl-1", "jobs", method="POST", body='{"entrypoint": "echo hi"}'
+    )
+    assert json.loads(resp.body)["job_id"] == "raysubmit_old"
+
+
+async def test_post_job_requires_an_entrypoint(jp_fetch, ray_server):
+    server = ray_server(body={"submission_id": "x"})
+    with pytest.raises(HTTPClientError) as exc:
+        await jp_fetch("bifrost", "clusters", "cl-1", "jobs", method="POST", body="{}")
+    assert exc.value.code == 400
+    assert json.loads(exc.value.response.body)["error"] == "missing 'entrypoint'"
+    assert server.requests == []  # nothing was submitted
+
+
+@pytest.mark.parametrize(
+    "env_vars",
+    ["NOT_A_MAP", ["A=1"], {"A": 1}, {"A": None}, {"A": True}, {"A": ["1"]}, {"": "1"}],
+)
+async def test_post_job_rejects_bad_env_vars(jp_fetch, ray_server, env_vars):
+    # Ray needs a flat str->str map; anything else is a clean 400, never a 500.
+    server = ray_server(body={"submission_id": "x"})
+    body = json.dumps({"entrypoint": "echo hi", "env_vars": env_vars})
+    with pytest.raises(HTTPClientError) as exc:
+        await jp_fetch("bifrost", "clusters", "cl-1", "jobs", method="POST", body=body)
+    assert exc.value.code == 400
+    assert json.loads(exc.value.response.body)["error"] == "invalid 'env_vars'"
+    assert server.requests == []
+
+
+async def test_post_job_rejects_invalid_body(jp_fetch, ray_server):
+    ray_server(body={"submission_id": "x"})
+    with pytest.raises(HTTPClientError) as exc:
+        await jp_fetch("bifrost", "clusters", "cl-1", "jobs", method="POST", body="not json")
+    assert exc.value.code == 400
+    assert json.loads(exc.value.response.body)["error"] == "invalid request body"
+
+
+async def test_post_job_unreachable_cluster_is_graceful(jp_fetch, ray_server):
+    # A cluster that is not up yet (DNS/connect failure surfaces raw from tornado)
+    # must map to a clean 502, never an unhandled 500.
+    ray_server(raises=ConnectionRefusedError("nope"))
+    with pytest.raises(HTTPClientError) as exc:
+        await jp_fetch(
+            "bifrost", "clusters", "cl-1", "jobs", method="POST", body='{"entrypoint": "echo hi"}'
+        )
+    assert exc.value.code == 502
+    assert json.loads(exc.value.response.body)["error"] == "ray cluster unreachable"
+
+
+async def test_post_job_connect_timeout_is_graceful(jp_fetch, ray_server):
+    # tornado's synthetic 599 for a connect timeout maps the same way.
+    ray_server(error=HTTPClientError(599, "Timeout"))
+    with pytest.raises(HTTPClientError) as exc:
+        await jp_fetch(
+            "bifrost", "clusters", "cl-1", "jobs", method="POST", body='{"entrypoint": "echo hi"}'
+        )
+    assert exc.value.code == 502
+    assert json.loads(exc.value.response.body)["error"] == "ray cluster unreachable"
+
+
+async def test_post_job_upstream_5xx_maps_to_502(jp_fetch, ray_server):
+    ray_server(error=HTTPClientError(500, "Internal Server Error"))
+    with pytest.raises(HTTPClientError) as exc:
+        await jp_fetch(
+            "bifrost", "clusters", "cl-1", "jobs", method="POST", body='{"entrypoint": "echo hi"}'
+        )
+    assert exc.value.code == 502
+    assert json.loads(exc.value.response.body)["error"] == "ray cluster error"
+
+
+async def test_post_job_upstream_4xx_maps_to_safe_message(jp_fetch, ray_server):
+    # The upstream body is discarded; only a fixed safe message is returned.
+    ray_server(error=HTTPClientError(400, "Bad Request: internal detail leaks here"))
+    with pytest.raises(HTTPClientError) as exc:
+        await jp_fetch(
+            "bifrost", "clusters", "cl-1", "jobs", method="POST", body='{"entrypoint": "echo hi"}'
+        )
+    assert exc.value.code == 400
+    assert json.loads(exc.value.response.body)["error"] == "invalid job request"
+    assert "internal detail" not in exc.value.response.body.decode()
+
+
+async def test_post_job_works_when_bifrost_is_unconfigured(jp_fetch, ray_server, monkeypatch):
+    # The jobs path never constructs a Bifrost client (the address is derived from
+    # id + namespace), so an unconfigured install still submits — proven
+    # behaviourally: it succeeds even when client_from_env would blow up.
+    def must_not_be_called():
+        raise AssertionError("the jobs path must not call the Bifrost control plane")
+
+    monkeypatch.setattr(handlers, "client_from_env", must_not_be_called)
+    ray_server(body={"submission_id": "raysubmit_abc"})
+    resp = await jp_fetch(
+        "bifrost", "clusters", "cl-1", "jobs", method="POST", body='{"entrypoint": "echo hi"}'
+    )
+    assert resp.code == 200
+    assert json.loads(resp.body)["job_id"] == "raysubmit_abc"
+
+
+async def test_get_job_status_maps_through(jp_fetch, ray_server):
+    server = ray_server(
+        body={
+            "status": "RUNNING",
+            "message": "Job is currently running.",
+            "start_time": 1234,
+            "end_time": None,
+            # Fields the panel has no business seeing are dropped.
+            "driver_agent_http_address": "http://10.0.0.7:52365",
+            "driver_node_id": "node-abc",
+            "runtime_env": {"env_vars": {"HF_TOKEN": "t"}},
+        }
+    )
+
+    resp = await jp_fetch("bifrost", "clusters", "cl-1", "jobs", "raysubmit_abc", method="GET")
+    assert resp.code == 200
+    assert json.loads(resp.body) == {
+        "job_id": "raysubmit_abc",
+        "status": "RUNNING",
+        "message": "Job is currently running.",
+        "start_time": 1234,
+        "end_time": None,
+    }
+
+    request = server.requests[0]
+    assert request.url == "http://cl-1-head-svc.bifrost.svc:8265/api/jobs/raysubmit_abc"
+    assert request.method == "GET"
+    # The env var value must not be echoed back to the browser.
+    assert "HF_TOKEN" not in resp.body.decode()
+
+
+async def test_get_job_status_maps_not_found(jp_fetch, ray_server):
+    ray_server(error=HTTPClientError(404, "Not Found"))
+    with pytest.raises(HTTPClientError) as exc:
+        await jp_fetch("bifrost", "clusters", "cl-1", "jobs", "ghost", method="GET")
+    assert exc.value.code == 404
+    assert json.loads(exc.value.response.body)["error"] == "job not found"
+
+
+async def test_get_job_status_unreachable_is_graceful(jp_fetch, ray_server):
+    ray_server(raises=OSError("dns failure"))
+    with pytest.raises(HTTPClientError) as exc:
+        await jp_fetch("bifrost", "clusters", "cl-1", "jobs", "raysubmit_abc", method="GET")
+    assert exc.value.code == 502
+    assert json.loads(exc.value.response.body)["error"] == "ray cluster unreachable"
+
+
+async def test_get_job_status_non_json_body_is_graceful(jp_fetch, monkeypatch):
+    # A cluster answering HTML (an ingress error page, say) must not 500.
+    class Garbage:
+        def __call__(self):
+            return self
+
+        async def fetch(self, request):
+            return HTTPResponse(request, 200, buffer=io.BytesIO(b"<html>nope</html>"))
+
+    monkeypatch.setattr(_jobs, "AsyncHTTPClient", Garbage())
+    with pytest.raises(HTTPClientError) as exc:
+        await jp_fetch("bifrost", "clusters", "cl-1", "jobs", "raysubmit_abc", method="GET")
+    assert exc.value.code == 502
+    assert json.loads(exc.value.response.body)["error"] == "invalid response from ray cluster"

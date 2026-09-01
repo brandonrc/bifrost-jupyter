@@ -88,3 +88,67 @@
 .jp-BifrostPanel-unconfigured {
   line-height: 1.4;
 }
+
+/* Job submit form (#11): entrypoint + env-var key/value editor. */
+
+.jp-BifrostPanel-job {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--jp-border-color2);
+}
+
+.jp-BifrostPanel-jobHeader {
+  margin: 0 0 6px;
+  font-size: var(--jp-ui-font-size1);
+}
+
+.jp-BifrostPanel-jobTarget {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--jp-ui-font-color2);
+  font-size: var(--jp-ui-font-size0);
+}
+
+.jp-BifrostPanel-jobEntrypoint {
+  box-sizing: border-box;
+  width: 100%;
+  font-family: var(--jp-code-font-family);
+}
+
+.jp-BifrostPanel-envHeader {
+  margin: 10px 0 4px;
+  color: var(--jp-ui-font-color2);
+  font-size: var(--jp-ui-font-size0);
+  text-transform: uppercase;
+}
+
+.jp-BifrostPanel-envRow {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 4px;
+}
+
+.jp-BifrostPanel-envKey,
+.jp-BifrostPanel-envValue {
+  flex: 1 1 0;
+  min-width: 0;
+  font-family: var(--jp-code-font-family);
+}
+
+.jp-BifrostPanel-envRemove {
+  flex: 0 0 auto;
+}
+
+.jp-BifrostPanel-envAdd {
+  margin-right: 8px;
+}
+
+.jp-BifrostPanel-jobStatus {
+  margin-top: 8px;
+  padding: 6px 8px;
+  border-radius: 2px;
+  background: var(--jp-layout-color2);
+  font-family: var(--jp-code-font-family);
+  font-size: var(--jp-ui-font-size0);
+  word-break: break-all;
+}

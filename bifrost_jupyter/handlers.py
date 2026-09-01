@@ -15,7 +15,7 @@ import tornado
 from jupyter_server.base.handlers import APIHandler
 from jupyter_server.utils import url_path_join
 
-from . import _address, _profiles
+from . import _address, _jobs, _profiles
 from .bifrost import BifrostAPIError, BifrostConfigError, client_from_env
 from .config import default_namespace
 
@@ -211,6 +211,89 @@ class ClusterLifecycleHandler(_BifrostHandler):
         self.finish(json.dumps({"id": cluster_id, "status": self._TRANSITIONS[action]}))
 
 
+class _RayJobsHandler(_BifrostHandler):
+    """Base for the two in-cluster Ray Jobs routes.
+
+    NOTE: these routes do **not** talk to Bifrost. They talk straight to the
+    cluster's own Ray head service (``<id>-head-svc.<ns>.svc:8265``), exactly
+    like ``/clusters/{id}/address``. The jupyter-server extension runs inside the
+    user's notebook pod, which carries the ``bifrost.dev/owner`` label, so the
+    per-owner NetworkPolicy admits it to :8265 — the NetworkPolicy is the gate,
+    **not** a bearer token. There is deliberately no ``Authorization`` header on
+    this path and none should be added; the Bifrost credential is only for the
+    control plane (create/list/delete/suspend/resume).
+
+    A consequence worth stating: since no Bifrost client is constructed, these
+    routes keep working on an install where Bifrost is unconfigured — the address
+    is derived from the cluster id + configured namespace alone, so there is no
+    ``BifrostConfigError`` to degrade from and never an unhandled 500.
+    """
+
+    def _jobs_address(self, cluster_id: str) -> str:
+        return _address.jobs_address(cluster_id, self.settings["bifrost_cluster_namespace"])
+
+
+class ClusterJobsHandler(_RayJobsHandler):
+    """``POST /bifrost/clusters/{id}/jobs`` — submit a Ray job (requirement #11).
+
+    Body: ``{"entrypoint": <str>, "env_vars": {<str>: <str>}}``. The env vars are
+    the whole point of #11: ``ClusterSpec`` has no env field, so they attach to
+    the *job* as ``runtime_env.env_vars`` (design §2, locked). Returns the Ray
+    submission id as ``{"job_id": …, "submission_id": …}``.
+    """
+
+    @tornado.web.authenticated
+    async def post(self, cluster_id: str) -> None:
+        try:
+            payload = json.loads(self.request.body or b"{}")
+        except json.JSONDecodeError:
+            self._fail(400, "invalid request body")
+            return
+        if not isinstance(payload, dict):
+            self._fail(400, "invalid request body")
+            return
+
+        entrypoint = payload.get("entrypoint")
+        if not entrypoint:
+            self._fail(400, "missing 'entrypoint'")
+            return
+        if not isinstance(entrypoint, str):
+            self._fail(400, "invalid 'entrypoint'")
+            return
+
+        try:
+            env_vars = _jobs.clean_env_vars(payload.get("env_vars"))
+        except ValueError as exc:
+            self._fail(400, str(exc))
+            return
+
+        try:
+            result = await _jobs.submit_job(self._jobs_address(cluster_id), entrypoint, env_vars)
+        except _jobs.RayJobsError as exc:
+            self._fail(exc.status, exc.message)
+            return
+
+        self.finish(json.dumps(result))
+
+
+class ClusterJobHandler(_RayJobsHandler):
+    """``GET /bifrost/clusters/{id}/jobs/{job_id}`` — one job's status.
+
+    Maps Ray's ``GET /api/jobs/{submission_id}``, reduced to the allowlisted
+    view (``status``/``message``/``start_time``/``end_time``) — not a passthrough
+    of Ray's full ``JobDetails``.
+    """
+
+    @tornado.web.authenticated
+    async def get(self, cluster_id: str, job_id: str) -> None:
+        try:
+            view = await _jobs.get_job(self._jobs_address(cluster_id), job_id)
+        except _jobs.RayJobsError as exc:
+            self._fail(exc.status, exc.message)
+            return
+        self.finish(json.dumps(view))
+
+
 def setup_handlers(web_app, namespace: str | None = None, profiles=None) -> None:
     host_pattern = ".*$"
     base_url = web_app.settings["base_url"]
@@ -220,11 +303,15 @@ def setup_handlers(web_app, namespace: str | None = None, profiles=None) -> None
     profiles_url = url_path_join(base_url, "bifrost", "profiles")
     clusters = url_path_join(base_url, "bifrost", "clusters")
     # Each pattern is anchored with ``$`` by tornado, and ``([^/]+)`` never spans a
-    # slash, so ``/clusters/{id}``, ``/clusters/{id}/address`` and
-    # ``/clusters/{id}/{suspend|resume}`` are mutually exclusive — order-independent.
+    # slash, so ``/clusters/{id}``, ``/clusters/{id}/address``,
+    # ``/clusters/{id}/{suspend|resume}``, ``/clusters/{id}/jobs`` and
+    # ``/clusters/{id}/jobs/{job_id}`` are mutually exclusive — order-independent.
+    # (``jobs`` cannot collide with the ``(suspend|resume)`` alternation either.)
     cluster = url_path_join(base_url, "bifrost", "clusters", r"([^/]+)")
     address = url_path_join(base_url, "bifrost", "clusters", r"([^/]+)", "address")
     lifecycle = url_path_join(base_url, "bifrost", "clusters", r"([^/]+)", r"(suspend|resume)")
+    jobs = url_path_join(base_url, "bifrost", "clusters", r"([^/]+)", "jobs")
+    job = url_path_join(base_url, "bifrost", "clusters", r"([^/]+)", "jobs", r"([^/]+)")
 
     web_app.add_handlers(
         host_pattern,
@@ -233,6 +320,8 @@ def setup_handlers(web_app, namespace: str | None = None, profiles=None) -> None
             (clusters, ClustersHandler),
             (address, ClusterAddressHandler),
             (lifecycle, ClusterLifecycleHandler),
+            (job, ClusterJobHandler),
+            (jobs, ClusterJobsHandler),
             (cluster, ClusterHandler),
         ],
     )

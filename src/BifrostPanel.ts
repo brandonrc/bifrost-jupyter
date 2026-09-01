@@ -18,18 +18,27 @@ import { Widget } from '@lumino/widgets';
 
 import {
   createCluster,
+  EnvVars,
   getAddress,
+  getJobStatus,
   ICluster,
   IProfileView,
   listClusters,
   listProfiles,
   resumeCluster,
   stopCluster,
+  submitJob,
   suspendCluster
 } from './api';
 
 /** How often the status list re-polls ``GET /bifrost/clusters`` (ms). */
 const POLL_INTERVAL_MS = 5000;
+
+/** How often a submitted job re-polls its status (ms). */
+const JOB_POLL_INTERVAL_MS = 3000;
+
+/** Ray job states that never change again — polling stops on these. */
+const TERMINAL_JOB_STATES = ['SUCCEEDED', 'FAILED', 'STOPPED'];
 
 /**
  * The "Ray Clusters" sidebar panel (design §3.1).
@@ -50,6 +59,21 @@ export class BifrostPanel extends Widget {
   private _pollTimer: number | null = null;
   /** Set once the server reports Bifrost is not configured; keeps Start off. */
   private _unconfigured = false;
+
+  // --- job submit form (#11) ---
+  // Created at declaration so TS sees them assigned before the constructor body;
+  // ``_buildJobForm`` configures and lays them out.
+  private _jobTarget = document.createElement('span');
+  private _jobEntrypoint = document.createElement('input');
+  private _envVars = document.createElement('div');
+  private _envAddButton = document.createElement('button');
+  private _jobSubmitButton = document.createElement('button');
+  private _jobStatus = document.createElement('div');
+  /** The running cluster the job form targets, if one has been chosen. */
+  private _jobCluster: string | null = null;
+  private _jobId: string | null = null;
+  private _jobPollTimer: number | null = null;
+  private _submitting = false;
 
   constructor(
     serverSettings: ServerConnection.ISettings,
@@ -116,6 +140,128 @@ export class BifrostPanel extends Widget {
     this.node.appendChild(this._messageBar);
     this.node.appendChild(statusHeader);
     this.node.appendChild(this._statusList);
+    this.node.appendChild(this._buildJobForm());
+  }
+
+  /**
+   * The job-submit form (#11): an entrypoint field plus a key/value env-var
+   * editor, targeting whichever running cluster the user picked with "Run job".
+   *
+   * The env vars are the point of requirement #11 — ``ClusterSpec`` has no env
+   * field, so they ride on the *job* and the server attaches them to Ray's
+   * ``runtime_env.env_vars`` at submit time (design §2).
+   */
+  private _buildJobForm(): HTMLElement {
+    const trans = this._trans;
+
+    const section = document.createElement('div');
+    section.className = 'jp-BifrostPanel-job';
+
+    const jobHeader = document.createElement('h3');
+    jobHeader.className = 'jp-BifrostPanel-jobHeader';
+    jobHeader.textContent = trans.__('Submit a job');
+    section.appendChild(jobHeader);
+
+    this._jobTarget.className = 'jp-BifrostPanel-jobTarget';
+    section.appendChild(this._jobTarget);
+
+    this._jobEntrypoint.type = 'text';
+    this._jobEntrypoint.className = 'jp-BifrostPanel-jobEntrypoint';
+    this._jobEntrypoint.placeholder = trans.__('python my_script.py');
+    this._jobEntrypoint.setAttribute('aria-label', trans.__('Entrypoint'));
+    this._jobEntrypoint.addEventListener('input', () => this._syncJobEnabled());
+    section.appendChild(this._jobEntrypoint);
+
+    const envHeader = document.createElement('h4');
+    envHeader.className = 'jp-BifrostPanel-envHeader';
+    envHeader.textContent = trans.__('Environment variables');
+    section.appendChild(envHeader);
+
+    this._envVars.className = 'jp-BifrostPanel-envVars';
+    section.appendChild(this._envVars);
+
+    this._configureButton(
+      this._envAddButton,
+      trans.__('Add variable'),
+      'jp-BifrostPanel-envAdd',
+      () => this._addEnvRow()
+    );
+    section.appendChild(this._envAddButton);
+
+    this._configureButton(
+      this._jobSubmitButton,
+      trans.__('Submit job'),
+      'jp-BifrostPanel-jobSubmit',
+      () => {
+        void this._onSubmitJob();
+      }
+    );
+    // Nothing to submit to until a running cluster is chosen.
+    this._jobSubmitButton.disabled = true;
+    section.appendChild(this._jobSubmitButton);
+
+    this._jobStatus.className = 'jp-BifrostPanel-jobStatus';
+    this._jobStatus.hidden = true;
+    section.appendChild(this._jobStatus);
+
+    // One blank row so the editor is usable without hunting for "Add variable".
+    this._addEnvRow();
+    this._renderJobTarget();
+
+    return section;
+  }
+
+  /** Append one blank ``KEY`` / ``value`` row to the env-var editor. */
+  private _addEnvRow(): void {
+    const row = document.createElement('div');
+    row.className = 'jp-BifrostPanel-envRow';
+
+    const key = document.createElement('input');
+    key.type = 'text';
+    key.className = 'jp-BifrostPanel-envKey';
+    key.placeholder = this._trans.__('NAME');
+    key.setAttribute('aria-label', this._trans.__('Variable name'));
+
+    const value = document.createElement('input');
+    value.type = 'text';
+    value.className = 'jp-BifrostPanel-envValue';
+    value.placeholder = this._trans.__('value');
+    value.setAttribute('aria-label', this._trans.__('Variable value'));
+
+    const remove = this._actionButton(
+      this._trans.__('Remove'),
+      'jp-BifrostPanel-envRemove',
+      () => row.remove()
+    );
+
+    row.appendChild(key);
+    row.appendChild(value);
+    row.appendChild(remove);
+    this._envVars.appendChild(row);
+  }
+
+  /**
+   * Collect the editor's rows into the ``{name: value}`` map sent to the server.
+   * Rows with a blank name are ignored, so a half-filled row never submits.
+   */
+  private _collectEnvVars(): EnvVars {
+    const envVars: EnvVars = {};
+    const rows = this._envVars.querySelectorAll('.jp-BifrostPanel-envRow');
+    rows.forEach(row => {
+      const key = (
+        row.querySelector('.jp-BifrostPanel-envKey') as HTMLInputElement | null
+      )?.value.trim();
+      const value =
+        (
+          row.querySelector(
+            '.jp-BifrostPanel-envValue'
+          ) as HTMLInputElement | null
+        )?.value ?? '';
+      if (key) {
+        envVars[key] = value;
+      }
+    });
+    return envVars;
   }
 
   /** Load profiles and start polling once the panel is shown. */
@@ -130,11 +276,13 @@ export class BifrostPanel extends Widget {
 
   protected onBeforeDetach(msg: Message): void {
     this._stopPolling();
+    this._stopJobPolling();
     super.onBeforeDetach(msg);
   }
 
   dispose(): void {
     this._stopPolling();
+    this._stopJobPolling();
     super.dispose();
   }
 
@@ -245,6 +393,7 @@ export class BifrostPanel extends Widget {
 
   private _renderStatus(clusters: ICluster[]): void {
     this._statusList.innerHTML = '';
+    this._syncJobTarget(clusters);
 
     if (clusters.length === 0) {
       const empty = document.createElement('li');
@@ -296,6 +445,13 @@ export class BifrostPanel extends Widget {
       );
       actions.appendChild(
         this._actionButton(
+          this._trans.__('Run job'),
+          'jp-BifrostPanel-runJob',
+          () => this._targetJob(cluster.id)
+        )
+      );
+      actions.appendChild(
+        this._actionButton(
           this._trans.__('Suspend'),
           'jp-BifrostPanel-suspend',
           () => this._onSuspend(cluster.id)
@@ -326,7 +482,21 @@ export class BifrostPanel extends Widget {
     className: string,
     onClick: () => void
   ): HTMLButtonElement {
-    const button = document.createElement('button');
+    return this._configureButton(
+      document.createElement('button'),
+      label,
+      className,
+      onClick
+    );
+  }
+
+  /** Give an existing button its class, label and handler. */
+  private _configureButton(
+    button: HTMLButtonElement,
+    label: string,
+    className: string,
+    onClick: () => void
+  ): HTMLButtonElement {
     button.className = `${className} jp-mod-styled`;
     button.textContent = label;
     button.addEventListener('click', onClick);
@@ -416,6 +586,124 @@ export class BifrostPanel extends Widget {
   }
 
   /**
+   * Drop the job-form target if that cluster is gone or no longer running — a
+   * stopped/suspended cluster has no Jobs API to submit to, so Submit must not
+   * stay enabled against it.
+   */
+  private _syncJobTarget(clusters: ICluster[]): void {
+    if (this._jobCluster === null) {
+      return;
+    }
+    const stillRunning = clusters.some(
+      cluster => cluster.id === this._jobCluster && cluster.state === 'running'
+    );
+    if (!stillRunning) {
+      this._jobCluster = null;
+      this._stopJobPolling();
+      this._renderJobTarget();
+      this._syncJobEnabled();
+    }
+  }
+
+  /** "Run job" on a running cluster: point the job form at it. */
+  private _targetJob(id: string): void {
+    this._jobCluster = id;
+    this._renderJobTarget();
+    this._syncJobEnabled();
+  }
+
+  private _renderJobTarget(): void {
+    this._jobTarget.textContent = this._jobCluster
+      ? this._trans.__('Target: %1', this._jobCluster)
+      : this._trans.__('Choose "Run job" on a running cluster.');
+  }
+
+  /**
+   * Submit is gated the same way Start is: off when Bifrost is unconfigured, off
+   * while a submit is in flight, and off until a running cluster is targeted and
+   * an entrypoint is typed.
+   */
+  private _syncJobEnabled(): void {
+    this._jobSubmitButton.disabled =
+      this._unconfigured ||
+      this._submitting ||
+      this._jobCluster === null ||
+      this._jobEntrypoint.value.trim() === '';
+  }
+
+  /**
+   * Submit the job (#11): entrypoint + the env-var editor's map go to
+   * ``POST /bifrost/clusters/{id}/jobs``; the server attaches the env vars to
+   * Ray's ``runtime_env.env_vars``. Then poll the returned job id for status.
+   */
+  private async _onSubmitJob(): Promise<void> {
+    const cluster = this._jobCluster;
+    const entrypoint = this._jobEntrypoint.value.trim();
+    if (cluster === null || entrypoint === '') {
+      return;
+    }
+
+    this._stopJobPolling();
+    this._submitting = true;
+    this._syncJobEnabled();
+    this._showJobStatus(this._trans.__('Submitting job…'));
+    try {
+      const result = await submitJob(
+        this._serverSettings,
+        cluster,
+        entrypoint,
+        this._collectEnvVars()
+      );
+      this._jobId = result.job_id;
+      this._showJobStatus(this._trans.__('Submitted %1.', result.job_id));
+      // Arm the timer *before* the first read: a job that is already terminal
+      // stops the polling from inside that read, and a timer started afterwards
+      // would poll a finished job forever.
+      this._jobPollTimer = window.setInterval(() => {
+        void this._refreshJobStatus();
+      }, JOB_POLL_INTERVAL_MS);
+      await this._refreshJobStatus();
+    } catch (error) {
+      this._showJobStatus(
+        this._trans.__('Job submit failed: %1', errorText(error))
+      );
+    } finally {
+      this._submitting = false;
+      this._syncJobEnabled();
+    }
+  }
+
+  private async _refreshJobStatus(): Promise<void> {
+    const cluster = this._jobCluster;
+    const jobId = this._jobId;
+    if (cluster === null || jobId === null) {
+      return;
+    }
+    try {
+      const job = await getJobStatus(this._serverSettings, cluster, jobId);
+      const state = job.status ?? this._trans.__('unknown');
+      this._showJobStatus(this._trans.__('%1: %2', jobId, state));
+      if (TERMINAL_JOB_STATES.includes(state)) {
+        this._stopJobPolling();
+      }
+    } catch (error) {
+      this._showJobStatus(this._trans.__('%1: %2', jobId, errorText(error)));
+    }
+  }
+
+  private _showJobStatus(message: string): void {
+    this._jobStatus.hidden = false;
+    this._jobStatus.textContent = message;
+  }
+
+  private _stopJobPolling(): void {
+    if (this._jobPollTimer !== null) {
+      window.clearInterval(this._jobPollTimer);
+      this._jobPollTimer = null;
+    }
+  }
+
+  /**
    * Render the "installed but not configured" state: a plain, non-error note
    * (no red styling, no message-bar spam) plus a disabled Start button.
    */
@@ -433,6 +721,7 @@ export class BifrostPanel extends Widget {
 
     this._startButton.title = this._trans.__('Bifrost is not configured');
     this._syncStartEnabled();
+    this._syncJobEnabled();
   }
 
   private _renderStatusError(message: string): void {

@@ -20,6 +20,33 @@ preconfigured Ray `JobSubmissionClient` pointed at the Bifrost gateway.
 > wired up. Feature logic (cluster start/stop, profiles, the connect helper)
 > lands in follow-up tasks.
 
+## Submitting jobs with environment variables
+
+A Ray `ClusterSpec` has no `env`/`runtime_env` field, so per-run environment
+variables attach to a **job**, not a cluster. The panel's "Run job" action on a
+running cluster opens an entrypoint field plus a key/value env-var editor, and
+posts to:
+
+```
+POST /bifrost/clusters/{id}/jobs   {"entrypoint": "python train.py",
+                                    "env_vars": {"HF_TOKEN": "..."}}
+GET  /bifrost/clusters/{id}/jobs/{job_id}
+```
+
+The server extension forwards this to the cluster's own Ray Jobs REST API
+(`POST http://<id>-head-svc.<namespace>.svc:8265/api/jobs/`) with the variables
+under `runtime_env.env_vars`, and returns the Ray submission id.
+
+Note this path does **not** go through Bifrost and carries **no bearer token**.
+The jupyter-server extension runs inside the user's notebook pod, which carries
+the `bifrost.dev/owner` label, so the per-owner NetworkPolicy admits it to the
+head service on `:8265` — reachability is the authorization. The Bifrost
+credential stays on the control-plane routes (start/list/stop/suspend/resume).
+Ray itself is **not** installed in the server environment for this: the Jobs
+REST contract is spoken directly over HTTP. Ray stays the optional
+`bifrost-jupyter[kernel]` extra, used only by the kernel-side `connect()`
+helper.
+
 ## Requirements
 
 - JupyterLab >= 4.0.0
