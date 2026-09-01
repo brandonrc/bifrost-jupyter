@@ -78,6 +78,33 @@ export interface IClusterAddress {
   snippet: string;
 }
 
+/**
+ * The env-var map submitted with a job — requirement #11.
+ *
+ * ``ClusterSpec`` has no env field, so these attach to the *job*: the server
+ * puts them under Ray's ``runtime_env.env_vars`` at submit time (design §2).
+ * Values must be strings; the server rejects anything else with a clean 400.
+ */
+export type EnvVars = Record<string, string>;
+
+/** Response of ``POST /bifrost/clusters/{id}/jobs`` — Ray's submission id. */
+export interface IJobSubmitResponse {
+  job_id: string;
+  submission_id: string;
+}
+
+/**
+ * Response of ``GET /bifrost/clusters/{id}/jobs/{job_id}`` — the allowlisted
+ * view of Ray's ``JobDetails`` (never the full passthrough).
+ */
+export interface IJobStatus {
+  job_id: string;
+  status?: string;
+  message?: string | null;
+  start_time?: number | null;
+  end_time?: number | null;
+}
+
 /** Response of ``GET /bifrost/clusters`` (list/status, design §3.2). */
 export interface IClustersResponse {
   clusters: ICluster[];
@@ -239,5 +266,40 @@ export async function getAddress(
   return bifrostRequest<IClusterAddress>(
     serverSettings,
     clusterPath(id, 'address')
+  );
+}
+
+/**
+ * ``POST /bifrost/clusters/{id}/jobs`` — submit a Ray job with env vars (#11).
+ *
+ * Like every call in this module this goes to the user's own Jupyter server,
+ * same-origin, with no token: the server forwards it to the cluster's in-cluster
+ * Ray Jobs API and puts ``envVars`` under ``runtime_env.env_vars``.
+ */
+export async function submitJob(
+  serverSettings: ServerConnection.ISettings,
+  id: string,
+  entrypoint: string,
+  envVars: EnvVars = {}
+): Promise<IJobSubmitResponse> {
+  return bifrostRequest<IJobSubmitResponse>(
+    serverSettings,
+    clusterPath(id, 'jobs'),
+    {
+      method: 'POST',
+      body: JSON.stringify({ entrypoint, env_vars: envVars })
+    }
+  );
+}
+
+/** ``GET /bifrost/clusters/{id}/jobs/{job_id}`` — one submitted job's status. */
+export async function getJobStatus(
+  serverSettings: ServerConnection.ISettings,
+  id: string,
+  jobId: string
+): Promise<IJobStatus> {
+  return bifrostRequest<IJobStatus>(
+    serverSettings,
+    clusterPath(id, 'jobs', encodeURIComponent(jobId))
   );
 }

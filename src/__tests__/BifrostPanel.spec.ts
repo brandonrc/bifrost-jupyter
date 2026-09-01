@@ -39,6 +39,10 @@ const resumeCluster = api.resumeCluster as jest.MockedFunction<
   typeof api.resumeCluster
 >;
 const getAddress = api.getAddress as jest.MockedFunction<typeof api.getAddress>;
+const submitJob = api.submitJob as jest.MockedFunction<typeof api.submitJob>;
+const getJobStatus = api.getJobStatus as jest.MockedFunction<
+  typeof api.getJobStatus
+>;
 
 /**
  * A fake notebook tracker + panel exposing exactly what the injection path
@@ -83,7 +87,17 @@ describe('BifrostPanel', () => {
     suspendCluster.mockReset();
     resumeCluster.mockReset();
     getAddress.mockReset();
+    submitJob.mockReset();
+    getJobStatus.mockReset();
     insertBelow.mockReset();
+    submitJob.mockResolvedValue({
+      job_id: 'raysubmit_abc',
+      submission_id: 'raysubmit_abc'
+    });
+    getJobStatus.mockResolvedValue({
+      job_id: 'raysubmit_abc',
+      status: 'SUCCEEDED'
+    });
     listProfiles.mockResolvedValue([SMALL]);
     listClusters.mockResolvedValue({ clusters: [], configured: true });
     stopCluster.mockResolvedValue({ id: 'x', status: 'stopping' });
@@ -237,8 +251,9 @@ describe('BifrostPanel', () => {
     return panel.node.querySelector(cls) as HTMLButtonElement | null;
   }
 
-  it('shows Connect, Suspend and Stop for a running cluster (no Resume)', async () => {
+  it('shows Connect, Run job, Suspend and Stop for a running cluster (no Resume)', async () => {
     await attachedWith('running');
+    expect(actionButton('.jp-BifrostPanel-runJob')).not.toBeNull();
     expect(actionButton('.jp-BifrostPanel-connect')).not.toBeNull();
     expect(actionButton('.jp-BifrostPanel-suspend')).not.toBeNull();
     expect(actionButton('.jp-BifrostPanel-stop')).not.toBeNull();
@@ -251,12 +266,14 @@ describe('BifrostPanel', () => {
     expect(actionButton('.jp-BifrostPanel-stop')).not.toBeNull();
     expect(actionButton('.jp-BifrostPanel-suspend')).toBeNull();
     expect(actionButton('.jp-BifrostPanel-connect')).toBeNull();
+    expect(actionButton('.jp-BifrostPanel-runJob')).toBeNull();
   });
 
   it('shows only Stop for a pending cluster', async () => {
     await attachedWith('pending');
     expect(actionButton('.jp-BifrostPanel-stop')).not.toBeNull();
     expect(actionButton('.jp-BifrostPanel-connect')).toBeNull();
+    expect(actionButton('.jp-BifrostPanel-runJob')).toBeNull();
     expect(actionButton('.jp-BifrostPanel-suspend')).toBeNull();
     expect(actionButton('.jp-BifrostPanel-resume')).toBeNull();
   });
@@ -328,5 +345,240 @@ describe('BifrostPanel', () => {
     expect(
       panel.node.querySelector('.jp-BifrostPanel-message')?.textContent
     ).toContain('Open a notebook');
+  });
+  // --- job submit form (#11: env vars -> runtime_env.env_vars server-side) ---
+
+  function jobSubmitButton(): HTMLButtonElement {
+    return panel.node.querySelector(
+      '.jp-BifrostPanel-jobSubmit'
+    ) as HTMLButtonElement;
+  }
+
+  function entrypointInput(): HTMLInputElement {
+    return panel.node.querySelector(
+      '.jp-BifrostPanel-jobEntrypoint'
+    ) as HTMLInputElement;
+  }
+
+  function envRows(): HTMLElement[] {
+    return Array.from(
+      panel.node.querySelectorAll('.jp-BifrostPanel-envRow')
+    ) as HTMLElement[];
+  }
+
+  function setEnvRow(index: number, key: string, value: string): void {
+    const row = envRows()[index];
+    const keyInput = row.querySelector(
+      '.jp-BifrostPanel-envKey'
+    ) as HTMLInputElement;
+    const valueInput = row.querySelector(
+      '.jp-BifrostPanel-envValue'
+    ) as HTMLInputElement;
+    keyInput.value = key;
+    valueInput.value = value;
+  }
+
+  function typeEntrypoint(text: string): void {
+    entrypointInput().value = text;
+    entrypointInput().dispatchEvent(new Event('input'));
+  }
+
+  /** Target the running cluster and type an entrypoint — the enabled state. */
+  async function readyToSubmit(entrypoint = 'python train.py') {
+    await attachedWith('running');
+    actionButton('.jp-BifrostPanel-runJob')!.click();
+    typeEntrypoint(entrypoint);
+  }
+
+  it('keeps Submit disabled until a running cluster and an entrypoint are set', async () => {
+    await attachedWith('running');
+    expect(jobSubmitButton().disabled).toBe(true);
+
+    // An entrypoint alone is not enough — there is no target cluster yet.
+    typeEntrypoint('python train.py');
+    expect(jobSubmitButton().disabled).toBe(true);
+
+    // Targeting a running cluster with "Run job" completes the gate.
+    actionButton('.jp-BifrostPanel-runJob')!.click();
+    expect(jobSubmitButton().disabled).toBe(false);
+
+    // Clearing the entrypoint disables it again.
+    typeEntrypoint('   ');
+    expect(jobSubmitButton().disabled).toBe(true);
+  });
+
+  it('keeps Submit disabled when Bifrost is unconfigured', async () => {
+    listClusters.mockResolvedValue({ clusters: [], configured: false });
+    panel = new BifrostPanel(settings());
+    Widget.attach(panel, document.body);
+    await flush();
+
+    typeEntrypoint('python train.py');
+    expect(jobSubmitButton().disabled).toBe(true);
+  });
+
+  it('collects the env-var editor rows into the submitJob env map', async () => {
+    await readyToSubmit();
+
+    // One blank row exists by default; "Add variable" appends more.
+    expect(envRows()).toHaveLength(1);
+    panel.node
+      .querySelector<HTMLButtonElement>('.jp-BifrostPanel-envAdd')!
+      .click();
+    panel.node
+      .querySelector<HTMLButtonElement>('.jp-BifrostPanel-envAdd')!
+      .click();
+    expect(envRows()).toHaveLength(3);
+
+    setEnvRow(0, 'HF_TOKEN', 'secret');
+    setEnvRow(1, '  SEED  ', '7');
+    // A row with no name is ignored rather than submitted as an empty key.
+    setEnvRow(2, '', 'orphan');
+
+    jobSubmitButton().click();
+    await flush();
+
+    expect(submitJob).toHaveBeenCalledTimes(1);
+    expect(submitJob).toHaveBeenCalledWith(
+      expect.anything(),
+      'jl-run-aaa',
+      'python train.py',
+      { HF_TOKEN: 'secret', SEED: '7' }
+    );
+  });
+
+  it('removes a row from the env editor', async () => {
+    await readyToSubmit();
+    panel.node
+      .querySelector<HTMLButtonElement>('.jp-BifrostPanel-envAdd')!
+      .click();
+    setEnvRow(0, 'KEEP', '1');
+    setEnvRow(1, 'DROP', '2');
+
+    envRows()[1]
+      .querySelector<HTMLButtonElement>('.jp-BifrostPanel-envRemove')!
+      .click();
+    expect(envRows()).toHaveLength(1);
+
+    jobSubmitButton().click();
+    await flush();
+
+    expect(submitJob).toHaveBeenCalledWith(
+      expect.anything(),
+      'jl-run-aaa',
+      'python train.py',
+      { KEEP: '1' }
+    );
+  });
+
+  it('shows the returned job id and its polled status', async () => {
+    getJobStatus.mockResolvedValue({
+      job_id: 'raysubmit_abc',
+      status: 'RUNNING'
+    });
+    await readyToSubmit();
+
+    jobSubmitButton().click();
+    await flush();
+
+    expect(getJobStatus).toHaveBeenCalledWith(
+      expect.anything(),
+      'jl-run-aaa',
+      'raysubmit_abc'
+    );
+    const status = panel.node.querySelector('.jp-BifrostPanel-jobStatus');
+    expect(status?.textContent).toContain('raysubmit_abc');
+    expect(status?.textContent).toContain('RUNNING');
+  });
+
+  it('stops polling once the job reaches a terminal state', async () => {
+    jest.useFakeTimers();
+    getJobStatus.mockResolvedValue({
+      job_id: 'raysubmit_abc',
+      status: 'SUCCEEDED'
+    });
+    listClusters.mockResolvedValue({
+      clusters: [{ id: 'jl-run-aaa', state: 'running' }],
+      configured: true
+    });
+    panel = new BifrostPanel(settings());
+    Widget.attach(panel, document.body);
+    await Promise.resolve();
+    await Promise.resolve();
+    actionButton('.jp-BifrostPanel-runJob')!.click();
+    typeEntrypoint('python train.py');
+
+    jobSubmitButton().click();
+    // Let the submit + the first status read settle.
+    for (let i = 0; i < 10; i++) {
+      await Promise.resolve();
+    }
+
+    const callsAfterSubmit = getJobStatus.mock.calls.length;
+    expect(callsAfterSubmit).toBeGreaterThan(0);
+    jest.advanceTimersByTime(60000);
+    expect(getJobStatus.mock.calls.length).toBe(callsAfterSubmit);
+    jest.useRealTimers();
+  });
+
+  it('keeps polling while the job is still running', async () => {
+    jest.useFakeTimers();
+    getJobStatus.mockResolvedValue({
+      job_id: 'raysubmit_abc',
+      status: 'RUNNING'
+    });
+    listClusters.mockResolvedValue({
+      clusters: [{ id: 'jl-run-aaa', state: 'running' }],
+      configured: true
+    });
+    panel = new BifrostPanel(settings());
+    Widget.attach(panel, document.body);
+    await Promise.resolve();
+    await Promise.resolve();
+    actionButton('.jp-BifrostPanel-runJob')!.click();
+    typeEntrypoint('python train.py');
+
+    jobSubmitButton().click();
+    for (let i = 0; i < 10; i++) {
+      await Promise.resolve();
+    }
+
+    const callsAfterSubmit = getJobStatus.mock.calls.length;
+    jest.advanceTimersByTime(3000);
+    expect(getJobStatus.mock.calls.length).toBeGreaterThan(callsAfterSubmit);
+    jest.useRealTimers();
+  });
+
+  it('renders a submit failure without throwing', async () => {
+    submitJob.mockRejectedValue(new Error('ray cluster unreachable'));
+    await readyToSubmit();
+
+    jobSubmitButton().click();
+    await flush();
+
+    expect(
+      panel.node.querySelector('.jp-BifrostPanel-jobStatus')?.textContent
+    ).toContain('ray cluster unreachable');
+    expect(getJobStatus).not.toHaveBeenCalled();
+    // The button comes back so the user can retry.
+    expect(jobSubmitButton().disabled).toBe(false);
+  });
+
+  it('drops the job target when the cluster stops running', async () => {
+    await readyToSubmit();
+    expect(jobSubmitButton().disabled).toBe(false);
+
+    // The next status poll reports it suspended — there is no Jobs API to
+    // submit to any more.
+    listClusters.mockResolvedValue({
+      clusters: [{ id: 'jl-run-aaa', state: 'suspended' }],
+      configured: true
+    });
+    await (panel as any)._refreshStatus();
+
+    expect(jobSubmitButton().disabled).toBe(true);
+    expect(
+      panel.node.querySelector('.jp-BifrostPanel-jobTarget')?.textContent
+    ).toContain('Run job');
   });
 });

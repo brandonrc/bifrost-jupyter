@@ -3,10 +3,12 @@ import { ServerConnection } from '@jupyterlab/services';
 import {
   createCluster,
   getAddress,
+  getJobStatus,
   listClusters,
   listProfiles,
   resumeCluster,
   stopCluster,
+  submitJob,
   suspendCluster
 } from '../api';
 
@@ -162,6 +164,84 @@ describe('api same-origin invariant', () => {
     for (const [url, init] of spy.mock.calls) {
       expect(url as string).toContain(`${BASE_URL}bifrost/`);
       expect(url as string).not.toMatch(/bifrost.*\.(com|net|io|svc)/i);
+      const headers = ((init as RequestInit)?.headers ?? {}) as Record<
+        string,
+        string
+      >;
+      const headerKeys = Object.keys(headers).map(k => k.toLowerCase());
+      expect(headerKeys).not.toContain('authorization');
+    }
+  });
+
+  it('submitJob POSTs <baseUrl>/bifrost/clusters/{id}/jobs with entrypoint + env_vars', async () => {
+    captureRequests({
+      job_id: 'raysubmit_abc',
+      submission_id: 'raysubmit_abc'
+    });
+    await submitJob(makeSettings(), 'jl-run-aaa', 'python train.py', {
+      HF_TOKEN: 't',
+      SEED: '7'
+    });
+
+    const urls = requestedUrls();
+    expect(urls).toHaveLength(1);
+    expect(urls[0]).toBe(`${BASE_URL}bifrost/clusters/jl-run-aaa/jobs`);
+
+    const init = spy.mock.calls[0][1] as RequestInit;
+    expect(init.method).toBe('POST');
+    // Requirement #11: the env vars ride on the job; the server maps them to
+    // Ray's runtime_env.env_vars.
+    expect(JSON.parse(init.body as string)).toEqual({
+      entrypoint: 'python train.py',
+      env_vars: { HF_TOKEN: 't', SEED: '7' }
+    });
+  });
+
+  it('submitJob sends an empty env_vars map when none are given', async () => {
+    captureRequests({
+      job_id: 'raysubmit_abc',
+      submission_id: 'raysubmit_abc'
+    });
+    await submitJob(makeSettings(), 'jl-run-aaa', 'echo hi');
+
+    const init = spy.mock.calls[0][1] as RequestInit;
+    expect(JSON.parse(init.body as string)).toEqual({
+      entrypoint: 'echo hi',
+      env_vars: {}
+    });
+  });
+
+  it('getJobStatus GETs <baseUrl>/bifrost/clusters/{id}/jobs/{job_id}', async () => {
+    captureRequests({ job_id: 'raysubmit_abc', status: 'RUNNING' });
+    const job = await getJobStatus(
+      makeSettings(),
+      'jl-run-aaa',
+      'raysubmit_abc'
+    );
+
+    const urls = requestedUrls();
+    expect(urls).toHaveLength(1);
+    expect(urls[0]).toBe(
+      `${BASE_URL}bifrost/clusters/jl-run-aaa/jobs/raysubmit_abc`
+    );
+    expect(job.status).toBe('RUNNING');
+  });
+
+  it('job routes stay same-origin and tokenless', async () => {
+    captureRequests({
+      job_id: 'raysubmit_abc',
+      submission_id: 'raysubmit_abc'
+    });
+    const s = makeSettings();
+    await submitJob(s, 'jl-x', 'echo hi', { A: '1' });
+    await getJobStatus(s, 'jl-x', 'raysubmit_abc');
+
+    for (const [url, init] of spy.mock.calls) {
+      expect(url as string).toContain(`${BASE_URL}bifrost/`);
+      expect(url as string).not.toMatch(/bifrost.*\.(com|net|io|svc)/i);
+      // Never the cluster's own head service / Ray Jobs API from the browser.
+      expect(url as string).not.toContain('8265');
+      expect(url as string).not.toContain('/api/jobs/');
       const headers = ((init as RequestInit)?.headers ?? {}) as Record<
         string,
         string
