@@ -17,6 +17,7 @@ from jupyter_server.utils import url_path_join
 
 from . import _address, _profiles
 from .bifrost import BifrostAPIError, BifrostConfigError, client_from_env
+from .config import default_namespace
 
 
 class _BifrostHandler(APIHandler):
@@ -55,40 +56,31 @@ class ClustersHandler(_BifrostHandler):
 
 
 class ClusterAddressHandler(_BifrostHandler):
-    """``GET /bifrost/clusters/{id}/address`` — the gateway Jobs address + snippet."""
+    """``GET /bifrost/clusters/{id}/address`` — the in-cluster Jobs address + snippet.
+
+    Derived purely from the cluster id and the configured namespace; makes no
+    Bifrost call. The in-cluster path needs no auth header — the per-owner
+    NetworkPolicy is the gate.
+    """
 
     @tornado.web.authenticated
     def get(self, cluster_id: str) -> None:
-        try:
-            client = self._client()
-        except BifrostConfigError:
-            self._fail(500, "bifrost extension is not configured")
-            return
-
-        try:
-            host = client.gateway_host(cluster_id)
-        except BifrostAPIError as exc:
-            self._fail(exc.status, exc.message)
-            return
-
-        if host is None:
-            self._fail(404, "cluster address not available")
-            return
-
+        namespace = self.settings["bifrost_cluster_namespace"]
         self.finish(
             json.dumps(
                 {
-                    "jobs_address": _address.jobs_address(host),
-                    "headers_hint": _address.headers_hint(),
-                    "snippet": _address.connect_snippet(host),
+                    "jobs_address": _address.jobs_address(cluster_id, namespace),
+                    "ray_client_address": _address.ray_client_address(cluster_id, namespace),
+                    "snippet": _address.connect_snippet(cluster_id, namespace),
                 }
             )
         )
 
 
-def setup_handlers(web_app) -> None:
+def setup_handlers(web_app, namespace: str | None = None) -> None:
     host_pattern = ".*$"
     base_url = web_app.settings["base_url"]
+    web_app.settings["bifrost_cluster_namespace"] = namespace or default_namespace()
 
     clusters = url_path_join(base_url, "bifrost", "clusters")
     address = url_path_join(base_url, "bifrost", "clusters", r"([^/]+)", "address")

@@ -7,6 +7,7 @@ except ImportError:
     import warnings
     warnings.warn("Importing 'bifrost_jupyter' outside a proper installation.")
     __version__ = "dev"
+from .config import BifrostConfig
 from .connect import connect
 from .handlers import setup_handlers
 
@@ -34,6 +35,7 @@ def _load_jupyter_server_extension(server_app):
     server_app: jupyterlab.labapp.LabApp
         JupyterLab application instance
     """
-    setup_handlers(server_app.web_app)
+    config = BifrostConfig(config=server_app.config)
+    setup_handlers(server_app.web_app, namespace=config.cluster_namespace)
     name = "bifrost_jupyter"
     server_app.log.info(f"Registered {name} server extension")

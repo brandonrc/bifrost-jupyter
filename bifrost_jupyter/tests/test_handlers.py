@@ -17,11 +17,9 @@ TOKEN = "mob_supersecrettoken"
 
 
 class FakeClient:
-    def __init__(self, *, view=None, host=None, create_error=None, address_error=None):
+    def __init__(self, *, view=None, create_error=None):
         self._view = view
-        self._host = host
         self._create_error = create_error
-        self._address_error = address_error
         self.created = None
 
     def create_cluster(self, body):
@@ -31,11 +29,6 @@ class FakeClient:
 
     def get_cluster(self, cluster_id):
         return self._view
-
-    def gateway_host(self, cluster_id):
-        if self._address_error:
-            raise self._address_error
-        return self._host
 
 
 @pytest.fixture
@@ -87,30 +80,28 @@ async def test_post_clusters_config_error(jp_fetch, monkeypatch):
     assert json.loads(exc.value.response.body)["error"] == "bifrost extension is not configured"
 
 
-async def test_get_address_returns_snippet(jp_fetch, patch_client):
-    patch_client(FakeClient(host="cl-1.gw.example"))
+async def test_get_address_returns_in_cluster_snippet(jp_fetch):
+    # Default namespace is "bifrost"; address is derived purely from id + namespace.
     resp = await jp_fetch("bifrost", "clusters", "cl-1", "address")
     assert resp.code == 200
     payload = json.loads(resp.body)
 
-    assert payload["jobs_address"] == "https://cl-1.gw.example"
-    assert payload["headers_hint"] == {"Authorization": "Bearer ${BIFROST_TOKEN}"}
+    assert payload["jobs_address"] == "http://cl-1-head-svc.bifrost.svc:8265"
+    assert payload["ray_client_address"] == "ray://cl-1-head-svc.bifrost.svc:10001"
     assert "JobSubmissionClient" in payload["snippet"]
-    # No real token anywhere in the address payload.
+    # In-cluster path carries no token / auth header.
     assert TOKEN not in resp.body.decode()
+    assert "Authorization" not in resp.body.decode()
 
 
-async def test_get_address_404_when_unregistered(jp_fetch, patch_client):
-    patch_client(FakeClient(host=None))
-    with pytest.raises(HTTPClientError) as exc:
-        await jp_fetch("bifrost", "clusters", "cl-unknown", "address")
-    assert exc.value.code == 404
-    assert json.loads(exc.value.response.body)["error"] == "cluster address not available"
+async def test_get_address_makes_no_backend_call(jp_fetch, monkeypatch):
+    # The address path must NOT touch Bifrost (the registry endpoint is Admin-only).
+    # Proven behaviorally: it succeeds even when constructing a Bifrost client would
+    # blow up — i.e. it never calls client_from_env / any control-plane endpoint.
+    def must_not_be_called():
+        raise AssertionError("address path must not call the Bifrost control plane")
 
-
-async def test_get_address_maps_forbidden(jp_fetch, patch_client):
-    patch_client(FakeClient(address_error=BifrostAPIError(403, "forbidden")))
-    with pytest.raises(HTTPClientError) as exc:
-        await jp_fetch("bifrost", "clusters", "cl-1", "address")
-    assert exc.value.code == 403
-    assert json.loads(exc.value.response.body)["error"] == "forbidden"
+    monkeypatch.setattr(handlers, "client_from_env", must_not_be_called)
+    resp = await jp_fetch("bifrost", "clusters", "cl-xyz", "address")
+    assert resp.code == 200
+    assert json.loads(resp.body)["jobs_address"] == "http://cl-xyz-head-svc.bifrost.svc:8265"

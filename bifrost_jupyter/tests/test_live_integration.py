@@ -5,13 +5,14 @@ set. Drives the same-origin ``/bifrost/*`` routes over HTTP (via ``jp_fetch``)
 with the *real* Bifrost client — no fakes — against a dev Bifrost.
 
 What this proves without a Ray backend: the profile→CreateCluster body is
-accepted by the real control plane, the get round-trip returns a status, and the
-address route resolves a gateway host from the live registry into a runnable
-snippet. What it does NOT prove (needs a live KubeRay): the cluster reaching
-``observed_state=running`` and a job actually running over the gateway Jobs API.
+accepted by the real control plane (create uses AuthorizeScoped Write) and the
+get round-trip returns a status (Read). What it does NOT prove (needs a live
+KubeRay): the cluster reaching ``observed_state=running`` and a job actually
+running over the in-cluster Jobs API.
 
-Point ``--registry`` at an entry whose ``id`` is ``BIFROST_LIVE_REGISTERED_ID``
-(default ``cl-test``) so the address route has a host to resolve.
+The address route is intentionally NOT exercised here: it makes no backend call
+(the address is derived client-side from id + namespace), so there is nothing
+live to verify beyond the unit tests.
 """
 
 import json
@@ -31,14 +32,4 @@ async def test_live_post_clusters(jp_fetch):
     payload = json.loads(resp.body)
     assert payload["id"]
     assert payload["status"]  # 'running' desired; observed may lag without a controller
-    assert os.environ["BIFROST_TOKEN"] not in resp.body.decode()
-
-
-async def test_live_get_address(jp_fetch):
-    registered_id = os.environ.get("BIFROST_LIVE_REGISTERED_ID", "cl-test")
-    resp = await jp_fetch("bifrost", "clusters", registered_id, "address")
-    assert resp.code == 200
-    payload = json.loads(resp.body)
-    assert payload["jobs_address"].startswith("https://")
-    assert "JobSubmissionClient" in payload["snippet"]
     assert os.environ["BIFROST_TOKEN"] not in resp.body.decode()

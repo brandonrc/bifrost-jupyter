@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import os
 
-from bifrost_client import ApiClient, ApiException, ClustersApi, Configuration, RegistryApi
+from bifrost_client import ApiClient, ApiException, ClustersApi, Configuration
 from bifrost_client.models.cluster_view import ClusterView
 from bifrost_client.models.create_cluster import CreateCluster
 
@@ -65,7 +65,6 @@ class BifrostClient:
         config = Configuration(host=api_url, access_token=token)
         api_client = ApiClient(config)
         self._clusters = ClustersApi(api_client)
-        self._registry = RegistryApi(api_client)
 
     def create_cluster(self, body: CreateCluster) -> None:
         try:
@@ -84,21 +83,6 @@ class BifrostClient:
             self._clusters.delete_cluster(cluster_id)
         except ApiException as exc:
             raise _translate(exc) from None
-
-    def gateway_host(self, cluster_id: str) -> str | None:
-        """Resolve the gateway hostname the cluster is exposed at, or ``None``.
-
-        The gateway routes by Host header, so this hostname is what a
-        ``JobSubmissionClient`` address must point at.
-        """
-        try:
-            entries = self._registry.list_registry()
-        except ApiException as exc:
-            raise _translate(exc) from None
-        for entry in entries:
-            if entry.id == cluster_id:
-                return entry.hostname
-        return None
 
 
 def client_from_env() -> BifrostClient:
