@@ -62,6 +62,14 @@ export interface ICluster {
 /** Response of ``GET /bifrost/clusters`` (list/status, design §3.2). */
 export interface IClustersResponse {
   clusters: ICluster[];
+  /**
+   * ``false`` when the server extension is installed but Bifrost is not
+   * configured (no ``BIFROST_API_URL`` / ``BIFROST_TOKEN``). A bare install is
+   * a normal state, not an error: the route answers 200 with this marker so the
+   * panel can show a friendly note instead of error-spamming. Absent/``true``
+   * means Bifrost is configured.
+   */
+  configured?: boolean;
 }
 
 /**
@@ -141,13 +149,15 @@ export async function createCluster(
   });
 }
 
-/** ``GET /bifrost/clusters`` — the list/status view (design §3.2). */
+/**
+ * ``GET /bifrost/clusters`` — the list/status view (design §3.2).
+ *
+ * Returns the full response (not just the array) so callers can read the
+ * ``configured`` marker and distinguish a bare, unconfigured install from a
+ * genuine upstream failure.
+ */
 export async function listClusters(
   serverSettings: ServerConnection.ISettings
-): Promise<ICluster[]> {
-  const data = await bifrostRequest<IClustersResponse>(
-    serverSettings,
-    'clusters'
-  );
-  return data.clusters;
+): Promise<IClustersResponse> {
+  return bifrostRequest<IClustersResponse>(serverSettings, 'clusters');
 }

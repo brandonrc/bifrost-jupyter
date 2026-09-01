@@ -78,8 +78,13 @@
 }
 
 .jp-BifrostPanel-empty,
-.jp-BifrostPanel-statusError {
+.jp-BifrostPanel-statusError,
+.jp-BifrostPanel-unconfigured {
   padding: 4px 0;
   color: var(--jp-ui-font-color2);
   font-size: var(--jp-ui-font-size0);
+}
+
+.jp-BifrostPanel-unconfigured {
+  line-height: 1.4;
 }

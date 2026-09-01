@@ -37,6 +37,8 @@ export class BifrostPanel extends Widget {
   private _statusList: HTMLUListElement;
   private _messageBar: HTMLDivElement;
   private _pollTimer: number | null = null;
+  /** Set once the server reports Bifrost is not configured; keeps Start off. */
+  private _unconfigured = false;
 
   constructor(
     serverSettings: ServerConnection.ISettings,
@@ -175,9 +177,14 @@ export class BifrostPanel extends Widget {
     this._syncStartEnabled();
   }
 
-  /** Start stays disabled unless a non-empty profile is selected. */
+  /**
+   * Start stays disabled unless a non-empty profile is selected — and always
+   * stays disabled when Bifrost is not configured (there is no backend to
+   * start against).
+   */
   private _syncStartEnabled(): void {
-    this._startButton.disabled = this._select.value === '';
+    this._startButton.disabled =
+      this._unconfigured || this._select.value === '';
   }
 
   private async _onStart(): Promise<void> {
@@ -206,8 +213,16 @@ export class BifrostPanel extends Widget {
 
   private async _refreshStatus(): Promise<void> {
     try {
-      const clusters = await listClusters(this._serverSettings);
-      this._renderStatus(clusters);
+      const response = await listClusters(this._serverSettings);
+      if (response.configured === false) {
+        // A bare, unconfigured install: show a friendly note and stop polling
+        // rather than re-hitting the route (which would keep answering the same
+        // "unconfigured" shape on every tick).
+        this._renderUnconfigured();
+        this._stopPolling();
+        return;
+      }
+      this._renderStatus(response.clusters);
     } catch (error) {
       // A transient poll failure should not spam the message bar; render an
       // inline note in the list instead.
@@ -243,6 +258,26 @@ export class BifrostPanel extends Widget {
       item.appendChild(state);
       this._statusList.appendChild(item);
     }
+  }
+
+  /**
+   * Render the "installed but not configured" state: a plain, non-error note
+   * (no red styling, no message-bar spam) plus a disabled Start button.
+   */
+  private _renderUnconfigured(): void {
+    this._unconfigured = true;
+
+    this._statusList.innerHTML = '';
+    const item = document.createElement('li');
+    item.className = 'jp-BifrostPanel-unconfigured';
+    item.textContent = this._trans.__(
+      'Bifrost is not configured. Set BIFROST_API_URL and BIFROST_TOKEN on the ' +
+        'Jupyter server to start and monitor clusters.'
+    );
+    this._statusList.appendChild(item);
+
+    this._startButton.title = this._trans.__('Bifrost is not configured');
+    this._syncStartEnabled();
   }
 
   private _renderStatusError(message: string): void {
