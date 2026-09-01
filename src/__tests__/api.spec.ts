@@ -127,15 +127,30 @@ describe('api response typing', () => {
     spy.mockRestore();
   });
 
-  it('returns the parsed clusters array', async () => {
+  it('returns the parsed clusters response', async () => {
     const spy = jest.spyOn(ServerConnection, 'makeRequest').mockResolvedValue(
       jsonResponse({
-        clusters: [{ id: 'jl-small-abc', state: 'running' }]
+        clusters: [{ id: 'jl-small-abc', state: 'running' }],
+        configured: true
       })
     );
 
-    const clusters = await listClusters(makeSettings());
-    expect(clusters).toEqual([{ id: 'jl-small-abc', state: 'running' }]);
+    const response = await listClusters(makeSettings());
+    expect(response.clusters).toEqual([
+      { id: 'jl-small-abc', state: 'running' }
+    ]);
+    expect(response.configured).toBe(true);
+    spy.mockRestore();
+  });
+
+  it('surfaces configured:false for a bare, unconfigured install', async () => {
+    const spy = jest
+      .spyOn(ServerConnection, 'makeRequest')
+      .mockResolvedValue(jsonResponse({ clusters: [], configured: false }));
+
+    const response = await listClusters(makeSettings());
+    expect(response.clusters).toEqual([]);
+    expect(response.configured).toBe(false);
     spy.mockRestore();
   });
 });

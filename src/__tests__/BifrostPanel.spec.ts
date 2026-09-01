@@ -43,7 +43,7 @@ describe('BifrostPanel', () => {
     listClusters.mockReset();
     createCluster.mockReset();
     listProfiles.mockResolvedValue([SMALL]);
-    listClusters.mockResolvedValue([]);
+    listClusters.mockResolvedValue({ clusters: [], configured: true });
   });
 
   afterEach(() => {
@@ -89,10 +89,13 @@ describe('BifrostPanel', () => {
   });
 
   it('renders each cluster id + state from listClusters', async () => {
-    listClusters.mockResolvedValue([
-      { id: 'jl-small-aaa', state: 'running' },
-      { id: 'jl-gpu-bbb', state: 'pending' }
-    ]);
+    listClusters.mockResolvedValue({
+      clusters: [
+        { id: 'jl-small-aaa', state: 'running' },
+        { id: 'jl-gpu-bbb', state: 'pending' }
+      ],
+      configured: true
+    });
     panel = new BifrostPanel(settings());
     Widget.attach(panel, document.body);
     await flush();
@@ -112,7 +115,7 @@ describe('BifrostPanel', () => {
   });
 
   it('shows an empty note when there are no clusters', async () => {
-    listClusters.mockResolvedValue([]);
+    listClusters.mockResolvedValue({ clusters: [], configured: true });
     panel = new BifrostPanel(settings());
     Widget.attach(panel, document.body);
     await flush();
@@ -120,6 +123,39 @@ describe('BifrostPanel', () => {
     expect(
       panel.node.querySelector('.jp-BifrostPanel-empty')?.textContent
     ).toContain('No clusters');
+  });
+
+  it('renders a friendly note and disables Start when Bifrost is unconfigured', async () => {
+    listClusters.mockResolvedValue({ clusters: [], configured: false });
+    panel = new BifrostPanel(settings());
+    Widget.attach(panel, document.body);
+    await flush();
+
+    const note = panel.node.querySelector('.jp-BifrostPanel-unconfigured');
+    expect(note?.textContent).toContain('not configured');
+    expect(note?.textContent).toContain('BIFROST_API_URL');
+    // No error styling / spam for a normal unconfigured state.
+    expect(panel.node.querySelector('.jp-BifrostPanel-statusError')).toBeNull();
+
+    // Start stays disabled even after a profile is chosen — there is no backend.
+    selectEl().value = 'small';
+    selectEl().dispatchEvent(new Event('change'));
+    expect(startButton().disabled).toBe(true);
+  });
+
+  it('stops polling once the server reports it is unconfigured', async () => {
+    jest.useFakeTimers();
+    listClusters.mockResolvedValue({ clusters: [], configured: false });
+    panel = new BifrostPanel(settings());
+    Widget.attach(panel, document.body);
+    // Let the initial onAfterAttach refresh settle.
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const callsAfterAttach = listClusters.mock.calls.length;
+    jest.advanceTimersByTime(30000);
+    expect(listClusters.mock.calls.length).toBe(callsAfterAttach);
+    jest.useRealTimers();
   });
 
   it('calls createCluster with the chosen profile on Start', async () => {

@@ -63,7 +63,12 @@ class ClustersHandler(_BifrostHandler):
         try:
             client = self._client()
         except BifrostConfigError:
-            self._fail(500, "bifrost extension is not configured")
+            # "Never configured" is a normal, expected state for a bare install,
+            # not an error. This route is polled on page load, so returning a
+            # 5xx here would spam the ServerApp error log and fail the headless
+            # Lab load check. Answer 200 with an explicit "unconfigured" shape
+            # instead; the panel renders a friendly note and backs off polling.
+            self.finish(json.dumps({"clusters": [], "configured": False}))
             return
 
         try:
@@ -73,14 +78,18 @@ class ClustersHandler(_BifrostHandler):
             return
 
         clusters = [{"id": v.id, "state": _observed_state(v)} for v in views]
-        self.finish(json.dumps({"clusters": clusters}))
+        self.finish(json.dumps({"clusters": clusters, "configured": True}))
 
     @tornado.web.authenticated
     def post(self) -> None:
         try:
             client = self._client()
         except BifrostConfigError:
-            self._fail(500, "bifrost extension is not configured")
+            # A start is a deliberate user action, not a page-load poll, so a
+            # clean 4xx (logged at warning, not error) is the right answer when
+            # Bifrost is not configured.
+            self.log.warning("bifrost: start requested but extension is not configured")
+            self._fail(409, "bifrost not configured")
             return
 
         try:
@@ -95,6 +104,11 @@ class ClustersHandler(_BifrostHandler):
         name = payload.get("profile")
         if not name:
             self._fail(400, "missing 'profile'")
+            return
+        if not isinstance(name, str):
+            # A non-string name would hit an unhashable/typed lookup downstream
+            # and 500; reject it as a clean 4xx here.
+            self._fail(400, "invalid 'profile'")
             return
 
         try:

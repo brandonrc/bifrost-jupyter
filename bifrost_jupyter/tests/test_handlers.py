@@ -76,15 +76,17 @@ async def test_post_clusters_maps_conflict(jp_fetch, patch_client):
     assert json.loads(exc.value.response.body)["error"] == "conflict"
 
 
-async def test_post_clusters_config_error(jp_fetch, monkeypatch):
+async def test_post_clusters_unconfigured_is_clean_4xx(jp_fetch, monkeypatch):
+    # A start when Bifrost is unconfigured is a user action, so it maps to a
+    # clean 4xx (not a 5xx / error-level log), never an unhandled 500.
     def boom():
         raise BifrostConfigError("no token")
 
     monkeypatch.setattr(handlers, "client_from_env", boom)
     with pytest.raises(HTTPClientError) as exc:
         await jp_fetch("bifrost", "clusters", method="POST", body='{"profile": "small"}')
-    assert exc.value.code == 500
-    assert json.loads(exc.value.response.body)["error"] == "bifrost extension is not configured"
+    assert exc.value.code == 409
+    assert json.loads(exc.value.response.body)["error"] == "bifrost not configured"
 
 
 async def test_post_clusters_missing_profile_is_rejected(jp_fetch, patch_client):
@@ -94,6 +96,17 @@ async def test_post_clusters_missing_profile_is_rejected(jp_fetch, patch_client)
         await jp_fetch("bifrost", "clusters", method="POST", body="{}")
     assert exc.value.code == 400
     assert json.loads(exc.value.response.body)["error"] == "missing 'profile'"
+
+
+@pytest.mark.parametrize("profile", [123, ["small"], {"name": "small"}, True])
+async def test_post_clusters_non_string_profile_is_rejected(jp_fetch, patch_client, profile):
+    # A non-string profile would hit a typed/unhashable lookup and 500; it must
+    # be a clean 400 instead, with no cluster created.
+    client = patch_client(FakeClient(view=SimpleNamespace(observed_state="running", desired="x")))
+    with pytest.raises(HTTPClientError) as exc:
+        await jp_fetch("bifrost", "clusters", method="POST", body=json.dumps({"profile": profile}))
+    assert exc.value.code == 400
+    assert client.created is None
 
 
 async def test_post_clusters_unknown_profile_is_rejected(jp_fetch, patch_client):
@@ -136,6 +149,7 @@ async def test_get_clusters_returns_list_with_id_and_state(jp_fetch, patch_clien
         {"id": "jl-small-aaa", "state": "running"},
         {"id": "jl-gpu-bbb", "state": "pending"},  # falls back to desired
     ]
+    assert payload["configured"] is True
     # The token must never be echoed back to the browser.
     assert TOKEN not in resp.body.decode()
 
@@ -155,15 +169,18 @@ async def test_get_clusters_maps_upstream_error(jp_fetch, patch_client):
     assert json.loads(exc.value.response.body)["error"] == "forbidden"
 
 
-async def test_get_clusters_config_error(jp_fetch, monkeypatch):
+async def test_get_clusters_unconfigured_returns_200_configured_false(jp_fetch, monkeypatch):
+    # A bare install (Bifrost unconfigured) is a normal state, not an error:
+    # the load-time poll must get a clean 200 with configured:false and raise
+    # nothing — no 5xx, no error-level ServerApp log.
     def boom():
         raise BifrostConfigError("no token")
 
     monkeypatch.setattr(handlers, "client_from_env", boom)
-    with pytest.raises(HTTPClientError) as exc:
-        await jp_fetch("bifrost", "clusters", method="GET")
-    assert exc.value.code == 500
-    assert json.loads(exc.value.response.body)["error"] == "bifrost extension is not configured"
+    resp = await jp_fetch("bifrost", "clusters", method="GET")
+    assert resp.code == 200
+    payload = json.loads(resp.body)
+    assert payload == {"clusters": [], "configured": False}
 
 
 async def test_get_profiles_returns_safe_view(jp_fetch):
@@ -180,6 +197,19 @@ async def test_get_profiles_returns_safe_view(jp_fetch):
         assert "image" not in p
         assert "ray_version" not in p
     assert "rayproject/ray" not in body  # image string never leaks
+
+
+async def test_get_profiles_unconfigured_returns_200(jp_fetch, monkeypatch):
+    # Profiles are the static, config-driven allowlist and never touch Bifrost,
+    # so the load-time poll returns 200 with the list even when Bifrost is
+    # unconfigured — and raises nothing (would-be client construction blows up).
+    def boom():
+        raise BifrostConfigError("no token")
+
+    monkeypatch.setattr(handlers, "client_from_env", boom)
+    resp = await jp_fetch("bifrost", "profiles")
+    assert resp.code == 200
+    assert len(json.loads(resp.body)["profiles"]) >= 1
 
 
 async def test_get_address_returns_in_cluster_snippet(jp_fetch):
