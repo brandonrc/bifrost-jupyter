@@ -3,7 +3,7 @@
 Holds the user credential server-side and attaches it as ``Authorization: Bearer``
 to every Bifrost call. The credential itself is resolved by
 :mod:`bifrost_jupyter._credentials` (design §4: OIDC access token from the pod
-env → optional RFC 8693 exchange → optional session PAT, with the ``mob_`` PAT in
+env → optional RFC 8693 exchange → optional session PAT, with the ``bfr_`` PAT in
 ``BIFROST_TOKEN`` as the dev fallback) and is never returned to the browser or
 written to a response body.
 
@@ -99,7 +99,7 @@ _STALE_CREDENTIAL_MESSAGE = (
     "(see 'Authentication' in the bifrost-jupyter README)"
 )
 
-#: A 401 on a credential that cannot be refreshed (the dev ``mob_`` PAT). Still
+#: A 401 on a credential that cannot be refreshed (the dev ``bfr_`` PAT). Still
 #: actionable — it just has a different remedy than the OIDC path's.
 _REJECTED_CREDENTIAL_MESSAGE = (
     "unauthorized: bifrost rejected the configured credential — it may be expired or "

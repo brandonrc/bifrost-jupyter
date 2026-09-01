@@ -19,7 +19,7 @@ Two gates:
 `identity == nil`, which short-circuits every authorization check in Bifrost. A
 Wave 2-C task once "live-verified" a feature that only worked for that reason;
 the finding was hollow and had to be retracted. Gate A therefore runs Bifrost
-with `--local-auth` and drives the extension with a **real `mob_` Bearer**, and
+with `--local-auth` and drives the extension with a **real `bfr_` Bearer**, and
 the transcripts below are from exactly that.
 
 ## Gate A — dev Bifrost with auth enforced
