@@ -3,28 +3,29 @@ import {
   JupyterFrontEndPlugin
 } from '@jupyterlab/application';
 
-import { requestAPI } from './request';
+import { ITranslator } from '@jupyterlab/translation';
+
+import { BifrostPanel } from './BifrostPanel';
 
 /**
  * Initialization data for the bifrost-jupyter extension.
+ *
+ * Registers the "Ray Clusters" panel in the left sidebar. The panel talks only
+ * to the co-located ``/bifrost/*`` server extension, same-origin, via
+ * ``ServerConnection`` (design §3.1) — no Bifrost URL or token in the browser.
  */
 const plugin: JupyterFrontEndPlugin<void> = {
   id: 'bifrost-jupyter:plugin',
   description:
     'JupyterLab extension to start, stop, and connect to Bifrost-fronted Ray clusters',
   autoStart: true,
-  activate: (app: JupyterFrontEnd) => {
-    console.log('JupyterLab extension bifrost-jupyter is activated!');
-
-    requestAPI<any>('hello', app.serviceManager.serverSettings)
-      .then(data => {
-        console.log(data);
-      })
-      .catch(reason => {
-        console.error(
-          `The bifrost_jupyter server extension appears to be missing.\n${reason}`
-        );
-      });
+  optional: [ITranslator],
+  activate: (app: JupyterFrontEnd, translator: ITranslator | null) => {
+    const panel = new BifrostPanel(
+      app.serviceManager.serverSettings,
+      translator ?? undefined
+    );
+    app.shell.add(panel, 'left', { rank: 200 });
   }
 };
 
