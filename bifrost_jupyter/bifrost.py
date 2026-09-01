@@ -20,8 +20,8 @@ Two behaviours here exist because credentials expire:
 Every call here is **synchronous and blocking** — the generated client is
 urllib3-based. Handlers must therefore never call these directly from tornado's
 IOLoop thread; :mod:`bifrost_jupyter.handlers` runs them in an executor. Every
-call also carries an explicit ``_request_timeout`` so a connected-but-silent
-server cannot pin a worker thread forever.
+call is bounded by the shared client in :mod:`bifrost_jupyter._apiclient`, so a
+connected-but-silent server cannot pin a worker thread forever.
 
 Upstream ``ApiException``\\s are translated to :class:`BifrostAPIError`, which
 carries only the HTTP status and a fixed, safe message — never the upstream
@@ -33,10 +33,11 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from bifrost_client import ApiClient, ApiException, ClustersApi, Configuration
+from bifrost_client import ApiException, ClustersApi, Configuration
 from bifrost_client.models.cluster_view import ClusterView
 from bifrost_client.models.create_cluster import CreateCluster
 
+from ._apiclient import DEFAULT_TIMEOUT_SECONDS, bounded_api_client
 from ._credentials import (
     BifrostConfigError,
     CredentialError,
@@ -86,19 +87,10 @@ _SAFE_MESSAGES = {
 }
 _DEFAULT_MESSAGE = "bifrost request failed"
 
-#: Total per-request budget for a Bifrost control-plane call, in seconds.
-#:
-#: Not a tuning knob — a liveness guarantee. The generated ``bifrost_client``
-#: leaves ``timeout = None`` unless a caller passes ``_request_timeout``
-#: (``bifrost_client/rest.py``), i.e. urllib3 waits forever. A Bifrost that
-#: accepts the connection and then never answers would pin a worker thread for
-#: the life of the notebook server, and with enough of them the executor pool
-#: fills and the handlers are back to being effectively blocking. Bounding every
-#: call is the half of the fix that survives a saturated pool.
-#:
-#: Generous rather than tight: a cluster create is a real control-plane
-#: operation, and a spurious timeout is a worse failure than a slow success.
-REQUEST_TIMEOUT_SECONDS = 30.0
+#: Re-exported so callers can name the budget; the value, and the reasoning for
+#: enforcing it at a chokepoint rather than per call site, live in
+#: :mod:`bifrost_jupyter._apiclient`.
+REQUEST_TIMEOUT_SECONDS = DEFAULT_TIMEOUT_SECONDS
 
 #: A 401 that survived a credential refresh. Says what to do, because the design
 #: is explicit that an expired credential must never reach the user as a mystery.
@@ -160,7 +152,9 @@ class BifrostClient:
         # every request, so refreshing the credential is a field assignment —
         # no client rebuild, and calls already bound keep working.
         self._config = Configuration(host=api_url, access_token=source.get())
-        self._clusters = ClustersApi(ApiClient(self._config))
+        # Bounded at the chokepoint, so this and every future endpoint wrapper
+        # is timeout-safe without each call site remembering (see ._apiclient).
+        self._clusters = ClustersApi(bounded_api_client(self._config, timeout))
 
     def _refresh_credential(self) -> bool:
         """Re-resolve the credential. ``False`` if this source cannot refresh."""
@@ -183,9 +177,10 @@ class BifrostClient:
         """
         for attempt in (0, 1):
             try:
-                # ``_request_timeout`` on EVERY call: without it the generated
-                # client waits forever (see REQUEST_TIMEOUT_SECONDS).
-                return getattr(self._clusters, name)(*args, _request_timeout=self._timeout)
+                # No per-call timeout argument by design: the client this is
+                # bound to supplies one for every request (see ._apiclient), so a
+                # new endpoint wrapper cannot forget it.
+                return getattr(self._clusters, name)(*args)
             except ApiException as exc:
                 if exc.status == 401:
                     if attempt == 0 and self._refresh_credential():

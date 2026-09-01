@@ -77,8 +77,10 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Protocol
 
-from bifrost_client import ApiClient, ApiException, AuthApi, Configuration
+from bifrost_client import ApiException, AuthApi, Configuration
 from bifrost_client.models.create_token_request import CreateTokenRequest
+
+from ._apiclient import bounded_api_client
 
 #: OIDC access token injected by the JupyterHub ``auth_state`` hook. The *_FILE
 #: form is preferred: it is re-read on every refresh, so a rotating file (a
@@ -484,12 +486,15 @@ def mint_session_pat(api_url: str, bearer: Credential) -> Credential | None:
     session must continue on the OIDC token rather than fail.
     """
     try:
-        api = AuthApi(ApiClient(Configuration(host=api_url, access_token=bearer.token)))
+        # Bounded by the shared chokepoint (see ._apiclient): the mint runs on a
+        # worker thread during session start, and unbounded it would pin one.
+        api = AuthApi(
+            bounded_api_client(
+                Configuration(host=api_url, access_token=bearer.token), _HTTP_TIMEOUT_SECS
+            )
+        )
         response = api.create_token(
-            CreateTokenRequest(label=_PAT_LABEL, expires_in_days=_pat_ttl_days()),
-            # Bounded like every other generated-client call: the mint runs on a
-            # worker thread during session start, and unbounded it would pin one.
-            _request_timeout=_HTTP_TIMEOUT_SECS,
+            CreateTokenRequest(label=_PAT_LABEL, expires_in_days=_pat_ttl_days())
         )
     except ApiException as exc:
         # Status only. ApiException stringifies its response body, which is

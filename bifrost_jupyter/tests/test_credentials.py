@@ -22,6 +22,7 @@ import pytest
 from bifrost_client import ApiException
 
 from bifrost_jupyter import _credentials
+from bifrost_jupyter._apiclient import BoundedApiClient
 
 API_URL = "https://bifrost.example"
 TOKEN_URL = "https://keycloak.example/realms/nebari/protocol/openid-connect/token"
@@ -84,6 +85,7 @@ def fake_auth_api(monkeypatch):
 
     class FakeAuthApi:
         def __init__(self, api_client):
+            self._api_client = api_client
             self._bearer = api_client.configuration.access_token
             self._host = api_client.configuration.host
 
@@ -94,6 +96,7 @@ def fake_auth_api(monkeypatch):
                     host=self._host,
                     label=request.label,
                     expires_in_days=request.expires_in_days,
+                    api_client=self._api_client,
                     timeout=kwargs.get("_request_timeout"),
                 )
             )
@@ -486,14 +489,22 @@ def test_session_resolver_resolves_once_per_session(monkeypatch, fake_auth_api):
 def test_the_pat_mint_is_bounded(monkeypatch, fake_auth_api):
     """The mint runs on a worker thread during session start. Unbounded, a
     connected-but-silent Bifrost would pin that thread for the life of the
-    server."""
+    server.
+
+    Asserted at the client, not at the call: the bound comes from the shared
+    chokepoint, so it holds for any endpoint this module calls later without
+    that call site having to remember.
+    """
     monkeypatch.setenv(_credentials.OIDC_TOKEN_ENV_VAR, make_jwt(time.time() + 3600))
     monkeypatch.setenv(_credentials.MINT_PAT_ENV_VAR, "1")
 
     _credentials.CredentialResolver(API_URL).credential()
 
     (call,) = fake_auth_api.calls
-    assert call.timeout == _credentials._HTTP_TIMEOUT_SECS
+    assert isinstance(call.api_client, BoundedApiClient)
+    assert call.api_client.default_timeout == _credentials._HTTP_TIMEOUT_SECS
+    # And the mint itself passes no per-call argument — it does not need to.
+    assert call.timeout is None
 
 
 # --- resolution is now concurrent, so it must be locked (Task 11) ----------

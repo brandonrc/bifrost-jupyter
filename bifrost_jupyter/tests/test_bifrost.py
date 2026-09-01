@@ -365,29 +365,71 @@ _OPS = [
 ]
 
 
+def _record_transport(client):
+    """Replace the client's transport, returning what each call reaches it with.
+
+    Stubbed at ``rest_client.request`` rather than at the endpoint method, so
+    everything above it — the generated endpoint, ``param_serialize``,
+    ``call_api``, and the bounded override — runs for real. This observes the
+    timeout that would actually be handed to urllib3, not one a test fake was
+    told to expect.
+    """
+    calls = []
+
+    def fake_request(method, url, headers=None, body=None, post_params=None, _request_timeout=None):
+        calls.append({"method": method, "url": url, "_request_timeout": _request_timeout})
+        return SimpleNamespace(status=200, data=b"[]", getheaders=lambda: {}, read=lambda: b"[]")
+
+    client._clusters.api_client.rest_client.request = fake_request
+    return calls
+
+
 @pytest.mark.parametrize("name,invoke", _OPS, ids=[n for n, _ in _OPS])
-def test_every_bifrost_call_carries_a_request_timeout(name, invoke):
+def test_every_bifrost_call_reaches_the_transport_bounded(name, invoke):
+    """Not "every call site remembers the argument" — the transport never sees a
+    ``None`` timeout, whichever endpoint is driven."""
     client = bifrost.BifrostClient(API_URL, TOKEN)
-    seen = {}
+    calls = _record_transport(client)
 
-    def record(*args, **kwargs):
-        seen.update(kwargs)
-        return SimpleNamespace(observed_state="running", desired="running")
+    try:
+        invoke(client)
+    except Exception:  # noqa: BLE001 - deserialising the stub body may fail; the call went out
+        pass
 
-    setattr(client._clusters, name, record)
-    invoke(client)
-
-    assert seen.get("_request_timeout") == bifrost.REQUEST_TIMEOUT_SECONDS, (
-        f"{name} was issued with no request timeout — urllib3 would wait forever"
+    assert calls, f"{name} issued no request"
+    assert calls[0]["_request_timeout"] == bifrost.REQUEST_TIMEOUT_SECONDS, (
+        f"{name} reached the transport unbounded — urllib3 would wait forever"
     )
 
 
 def test_the_timeout_is_configurable_per_client():
     client = bifrost.BifrostClient(API_URL, TOKEN, timeout=2.5)
-    seen = {}
-    client._clusters.list_clusters = lambda *a, **kw: seen.update(kw) or []
-    client.list_clusters()
-    assert seen["_request_timeout"] == 2.5
+    calls = _record_transport(client)
+    try:
+        client.list_clusters()
+    except Exception:  # noqa: BLE001
+        pass
+    assert calls[0]["_request_timeout"] == 2.5
+
+
+def test_an_endpoint_that_never_passes_a_timeout_is_still_bounded():
+    """The structural guarantee as a test: the bound does not depend on the
+    caller. This is what a future endpoint wrapper gets for free, and what a
+    per-call-site argument could never give it."""
+    client = bifrost.BifrostClient(API_URL, TOKEN)
+    calls = _record_transport(client)
+
+    # A caller that knows nothing about timeouts, as a new wrapper would be.
+    client._clusters.api_client.call_api("GET", f"{API_URL}/api/v1/anything")
+
+    assert calls[0]["_request_timeout"] == bifrost.REQUEST_TIMEOUT_SECONDS
+
+
+def test_an_explicit_timeout_still_wins():
+    client = bifrost.BifrostClient(API_URL, TOKEN)
+    calls = _record_transport(client)
+    client._clusters.api_client.call_api("GET", f"{API_URL}/x", _request_timeout=0.25)
+    assert calls[0]["_request_timeout"] == 0.25
 
 
 def _call_against_silent_server(timeout, join_seconds):
