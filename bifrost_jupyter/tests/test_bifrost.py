@@ -1,6 +1,9 @@
 """bifrost.py wrapper: credential attachment, refresh-on-401, safe errors."""
 
+import socket
+import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 from bifrost_client import ApiException
@@ -25,7 +28,7 @@ def test_credential_is_attached_to_outbound_config():
 def test_create_cluster_passes_body_through():
     client = bifrost.BifrostClient(API_URL, TOKEN)
     captured = {}
-    client._clusters.create_cluster = lambda body: captured.setdefault("body", body)
+    client._clusters.create_cluster = lambda body, **kw: captured.setdefault("body", body)
 
     body = build_create_cluster("small")
     client.create_cluster(body)
@@ -35,7 +38,7 @@ def test_create_cluster_passes_body_through():
 def test_list_clusters_passes_through():
     client = bifrost.BifrostClient(API_URL, TOKEN)
     views = [object(), object()]
-    client._clusters.list_clusters = lambda: views
+    client._clusters.list_clusters = lambda **kw: views
     assert client.list_clusters() is views
 
 
@@ -43,7 +46,7 @@ def test_list_clusters_passes_through():
 def test_lifecycle_ops_pass_id_through(op):
     client = bifrost.BifrostClient(API_URL, TOKEN)
     captured = {}
-    setattr(client._clusters, op, lambda cluster_id: captured.setdefault("id", cluster_id))
+    setattr(client._clusters, op, lambda cluster_id, **kw: captured.setdefault("id", cluster_id))
 
     getattr(client, op)("cl-42")
     assert captured["id"] == "cl-42"
@@ -53,7 +56,7 @@ def test_lifecycle_ops_pass_id_through(op):
 def test_lifecycle_ops_translate_error(op):
     client = bifrost.BifrostClient(API_URL, TOKEN)
 
-    def raiser(_cluster_id):
+    def raiser(_cluster_id, **_kw):
         raise ApiException(status=409, reason="upstream", body="SECRET internal detail")
 
     setattr(client._clusters, op, raiser)
@@ -68,7 +71,7 @@ def test_lifecycle_ops_translate_error(op):
 def test_list_clusters_translates_error():
     client = bifrost.BifrostClient(API_URL, TOKEN)
 
-    def raiser():
+    def raiser(**_kw):
         raise ApiException(status=403, reason="upstream", body="SECRET internal detail")
 
     client._clusters.list_clusters = raiser
@@ -99,7 +102,7 @@ def test_list_clusters_translates_error():
 def test_error_translation_is_safe(status, expected_status, expected_msg):
     client = bifrost.BifrostClient(API_URL, TOKEN)
 
-    def raiser(_cluster_id):
+    def raiser(_cluster_id, **_kw):
         raise ApiException(status=status, reason="upstream", body="SECRET internal stack trace")
 
     client._clusters.get_cluster = raiser
@@ -176,7 +179,7 @@ def test_401_refreshes_the_credential_and_retries_once():
     client = bifrost.BifrostClient(API_URL, source)
     seen = []
 
-    def flaky():
+    def flaky(**_kw):
         seen.append(client._config.access_token)
         if len(seen) == 1:
             raise ApiException(status=401, reason="upstream", body="SECRET token expired")
@@ -195,7 +198,7 @@ def test_refresh_is_attempted_at_most_once():
     client = bifrost.BifrostClient(API_URL, source)
     attempts = []
 
-    def always_401(_cluster_id):
+    def always_401(_cluster_id, **_kw):
         attempts.append(client._config.access_token)
         raise ApiException(status=401, reason="upstream", body="SECRET")
 
@@ -214,7 +217,7 @@ def test_a_credential_that_cannot_be_renewed_reports_the_reason():
     """Refresh itself failed: the user sees why, not a bare 401."""
     client = bifrost.BifrostClient(API_URL, UnrenewableCredential(["stale"]))
 
-    def always_401():
+    def always_401(**_kw):
         raise ApiException(status=401, reason="upstream", body="SECRET")
 
     client._clusters.list_clusters = always_401
@@ -231,7 +234,7 @@ def test_a_static_dev_pat_is_not_retried():
     client = bifrost.BifrostClient(API_URL, TOKEN)
     attempts = []
 
-    def always_401():
+    def always_401(**_kw):
         attempts.append(1)
         raise ApiException(status=401, reason="upstream", body="SECRET")
 
@@ -250,7 +253,7 @@ def test_a_static_dev_pat_is_not_retried():
 def test_lifecycle_403_names_the_operator_role(op):
     client = bifrost.BifrostClient(API_URL, TOKEN)
 
-    def raiser(_cluster_id):
+    def raiser(_cluster_id, **_kw):
         raise ApiException(status=403, reason="upstream", body="SECRET internal detail")
 
     setattr(client._clusters, op, raiser)
@@ -268,7 +271,7 @@ def test_create_403_names_the_operator_role():
     and without this message the panel would just say "forbidden"."""
     client = bifrost.BifrostClient(API_URL, TOKEN)
 
-    def raiser(_body):
+    def raiser(_body, **_kw):
         raise ApiException(status=403, reason="upstream", body="SECRET internal detail")
 
     client._clusters.create_cluster = raiser
@@ -285,7 +288,7 @@ def test_read_403_stays_generic():
     else (wrong project), so it must not claim the wrong remedy."""
     client = bifrost.BifrostClient(API_URL, TOKEN)
 
-    def raiser():
+    def raiser(**_kw):
         raise ApiException(status=403, reason="upstream", body="SECRET")
 
     client._clusters.list_clusters = raiser
@@ -343,3 +346,117 @@ def test_client_from_env_reuses_the_session_credential(monkeypatch):
     first = bifrost.client_from_env()
     second = bifrost.client_from_env()
     assert first._credentials is second._credentials
+
+
+# --- every outbound call is bounded (Task 11) ------------------------------
+#
+# The generated client leaves ``timeout = None`` unless a caller passes
+# ``_request_timeout`` (bifrost_client/rest.py), i.e. urllib3 waits forever. Off
+# the IOLoop that no longer freezes Lab, but it still pins a pool thread for the
+# life of the server, and enough of those starve the pool back into a freeze.
+
+_OPS = [
+    ("create_cluster", lambda c: c.create_cluster(build_create_cluster("small"))),
+    ("get_cluster", lambda c: c.get_cluster("cl-1")),
+    ("list_clusters", lambda c: c.list_clusters()),
+    ("delete_cluster", lambda c: c.delete_cluster("cl-1")),
+    ("suspend_cluster", lambda c: c.suspend_cluster("cl-1")),
+    ("resume_cluster", lambda c: c.resume_cluster("cl-1")),
+]
+
+
+@pytest.mark.parametrize("name,invoke", _OPS, ids=[n for n, _ in _OPS])
+def test_every_bifrost_call_carries_a_request_timeout(name, invoke):
+    client = bifrost.BifrostClient(API_URL, TOKEN)
+    seen = {}
+
+    def record(*args, **kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(observed_state="running", desired="running")
+
+    setattr(client._clusters, name, record)
+    invoke(client)
+
+    assert seen.get("_request_timeout") == bifrost.REQUEST_TIMEOUT_SECONDS, (
+        f"{name} was issued with no request timeout — urllib3 would wait forever"
+    )
+
+
+def test_the_timeout_is_configurable_per_client():
+    client = bifrost.BifrostClient(API_URL, TOKEN, timeout=2.5)
+    seen = {}
+    client._clusters.list_clusters = lambda *a, **kw: seen.update(kw) or []
+    client.list_clusters()
+    assert seen["_request_timeout"] == 2.5
+
+
+def _call_against_silent_server(timeout, join_seconds):
+    """Call ``list_clusters`` against a real socket that accepts and never answers.
+
+    Returns ``(finished, outcome)``. The server completes the TCP handshake and
+    then says nothing, which is the failure mode a request timeout exists for —
+    a refused connection or a DNS failure returns promptly on its own.
+    """
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(4)
+    port = listener.getsockname()[1]
+    accepted = []
+
+    def accept_and_stay_silent():
+        try:
+            while True:
+                conn, _ = listener.accept()
+                accepted.append(conn)  # held open, never written to
+        except OSError:
+            return
+
+    threading.Thread(target=accept_and_stay_silent, daemon=True).start()
+
+    client = bifrost.BifrostClient(f"http://127.0.0.1:{port}", TOKEN, timeout=timeout)
+    outcome = []
+
+    def call():
+        try:
+            client.list_clusters()
+            outcome.append("returned")
+        except BaseException as exc:  # noqa: BLE001 - any bounded failure is a pass
+            outcome.append(type(exc).__name__)
+
+    worker = threading.Thread(target=call, daemon=True)
+    worker.start()
+    worker.join(timeout=join_seconds)
+    finished = not worker.is_alive()
+    listener.close()
+    for conn in accepted:
+        conn.close()
+    return finished, outcome
+
+
+def test_an_unbounded_call_really_does_hang():
+    """The control arm: with no request timeout the call does not come back.
+
+    This is the defect the timeout closes, demonstrated rather than asserted —
+    the generated client leaves ``timeout = None`` when ``_request_timeout`` is
+    falsy, and urllib3 then waits indefinitely. The thread is left running
+    (daemon, so it does not hold the suite up)."""
+    finished, outcome = _call_against_silent_server(timeout=None, join_seconds=5.0)
+    assert not finished, f"expected no answer within 5s, got {outcome}"
+
+
+def test_a_connected_but_silent_server_does_not_hang_forever():
+    """The fix: the same call, bounded."""
+    started = time.monotonic()
+    finished, outcome = _call_against_silent_server(
+        timeout=1.0,
+        # Generously more than the 1s budget (urllib3 retries), far less than forever.
+        join_seconds=20.0,
+    )
+    elapsed = time.monotonic() - started
+    assert finished, (
+        "the call was still running after 20s against a silent server — "
+        "an unbounded request would pin this thread for the life of the server"
+    )
+    assert outcome and outcome[0] != "returned", f"unexpected success: {outcome}"
+    print(f"\nbounded failure after {elapsed:.1f}s: {outcome[0]}")
