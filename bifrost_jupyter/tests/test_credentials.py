@@ -8,6 +8,7 @@ escapes into a message, a log line or a repr.
 from __future__ import annotations
 
 import base64
+import dataclasses
 import json
 import logging
 import time
@@ -400,6 +401,32 @@ def test_pat_mint_transport_failure_degrades_to_the_oidc_token(monkeypatch, fake
 
 
 # --- the token never escapes ----------------------------------------------
+
+
+def test_credential_cannot_be_dumped_field_by_field():
+    """Redaction covers ``repr``/``str``; the generic *structural* dumps walk the
+    fields instead and would hand back the plaintext. ``Credential`` is therefore
+    not a dataclass and has no instance ``__dict__``, so every one of them fails
+    rather than quietly succeeding in some future debug handler."""
+    credential = _credentials.Credential("mob_supersecret", "dev-pat", None)
+
+    assert not dataclasses.is_dataclass(credential)
+    with pytest.raises(TypeError):
+        dataclasses.asdict(credential)  # type: ignore[call-overload]
+    with pytest.raises(TypeError):
+        dataclasses.astuple(credential)  # type: ignore[call-overload]
+    with pytest.raises(TypeError):
+        vars(credential)
+    assert not hasattr(credential, "__dict__")
+    # And the one deliberate way out still works.
+    assert credential.token == "mob_supersecret"
+
+
+def test_static_credential_cannot_be_dumped_field_by_field():
+    source = _credentials.StaticCredential("mob_supersecret")
+    assert not dataclasses.is_dataclass(source)
+    with pytest.raises(TypeError):
+        vars(source)
 
 
 def test_credential_redacts_itself_in_repr_and_str():

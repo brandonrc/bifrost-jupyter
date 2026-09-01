@@ -136,11 +136,13 @@ Bifrost source, that is not usable on the production OIDC path:
 - with local auth enabled it mints via `IssueToken(identity.Subject, …)`, which
   requires a **local user row** whose username equals the OIDC `sub` (a Keycloak
   UUID) — absent, that is a `500`;
-- and where such a row does exist, the resulting PAT authenticates as that local
-  user, whose owner is the `sub`, not `preferred_username`. Using it would
-  re-label new clusters with the UUID and silently break the owner match
-  described above. Group-derived project roles are lost too, since local
-  identities carry none.
+- and the two requirements are mutually exclusive, because they are the same
+  field. `IssueToken` looks the user up by `user.Username`, and that same
+  `user.Username` is what a PAT's identity returns as its owner. Making the mint
+  succeed therefore _requires_ `Username == sub` — which is exactly what then
+  stamps the wrong `bifrost.dev/owner` and silently breaks the owner match
+  described above. No configuration satisfies both. (Group-derived project roles
+  are lost as well, since local identities carry none.)
 
 So the OIDC path keeps the OIDC identity and handles lifetime by refreshing it.
 `BIFROST_MINT_PAT=1` enables the mint for deployments where Bifrost's identity
@@ -154,6 +156,72 @@ Bifrost triggers exactly one refresh-and-retry. When a refresh is impossible —
 an expired access token with no refresh token in the pod — the panel gets a
 `401` that says the token expired and what to do about it, not a bare
 "unauthorized" or an unhandled 500.
+
+## Connecting: the Ray Jobs API, and Ray Client as the advanced option
+
+The panel's **Connect** action injects a cell built around a
+`JobSubmissionClient` — the Ray **Jobs API** over HTTP on `:8265`, which is the
+path Ray upstream now recommends and the one everything else in this extension
+uses (job submit, job status, the dashboard):
+
+```python
+from ray.job_submission import JobSubmissionClient
+
+client = JobSubmissionClient("http://<id>-head-svc.<namespace>.svc:8265")
+```
+
+The same cell carries **Ray Client** (`ray://…:10001`, gRPC) commented out, as a
+deliberately-secondary option:
+
+```python
+# import ray
+# ray.init("ray://<id>-head-svc.<namespace>.svc:10001")
+```
+
+The difference matters, and it is not a style preference:
+
+- **Jobs API (`:8265`)** submits a _job_ — code that runs on the cluster,
+  detached from your kernel, with its own `runtime_env` (which is where #11's
+  env vars go). It survives a kernel restart, and it is what the panel, the
+  dashboard proxy and the job-status route speak.
+- **Ray Client (`:10001`)** attaches your _kernel process_ to the cluster's
+  driver. It is more interactive, but it is a long-lived gRPC session that dies
+  with the kernel, it is version-sensitive between client and cluster, and — the
+  operational point — it is reachable **only from the owner's own notebook pod**,
+  because the per-owner NetworkPolicy is what admits it.
+
+Both addresses are derived client-side from the cluster id and the configured
+namespace, and **neither carries a bearer token**: on this path the gate is the
+NetworkPolicy plus the validated cluster id (see the next section). Neither works
+from outside the cluster — remote/off-cluster access is deferred, and needs an
+owner-scoped address endpoint Bifrost does not have yet.
+
+An owner mismatch does **not** show up as "Ray Client is broken but jobs work":
+one NetworkPolicy rule guards `:10001` and `:8265` together, so both die at once
+while the Bifrost control plane keeps answering. If Ray Client hangs _and_ job
+submission fails while start/stop/list are fine, suspect the owner label, not the
+address.
+
+## Approved profiles, and why every profile must set `ttl_seconds`
+
+Users never send a raw manifest. `GET /bifrost/profiles` returns an
+admin-approved allowlist (built-in `small`/`medium`/`gpu`, replaceable wholesale
+via the `BifrostConfig.profiles` traitlet in `jupyter_server_config.py`), the
+panel shows those names, and the server maps the chosen **name** to a
+`ClusterSpec`. Nothing in the request body reaches the spec.
+
+**Every profile must set `ttl_seconds`, and the built-ins set 3600.** This is a
+correctness requirement, not a default worth tuning casually. Bifrost reaps idle
+clusters using `idle_timeout_secs`, which counts _gateway job activity_ — and an
+interactive cluster driven from a notebook submits no gateway jobs. It looks
+permanently idle-free to the reaper while doing nothing. `ttl_seconds` is an
+absolute cap that does not depend on activity, so it is the only thing standing
+between a forgotten panel tab and a cluster that runs until someone notices the
+bill. A profile without it is a capacity leak.
+
+Cluster ids are generated (`jl-<slug>-<12 hex>`) and kept short on purpose:
+KubeRay truncates the head-service name when a RayCluster name exceeds 41
+characters, which would break every derived address.
 
 ## Submitting jobs with environment variables
 
@@ -271,12 +339,37 @@ To install the extension, execute:
 pip install bifrost_jupyter
 ```
 
+That one command enables **both** halves — there is no separate
+`jupyter labextension install` step and **no Node toolchain is needed at install
+time**. The wheel ships the labextension already built, as prebuilt JS under
+`share/jupyter/labextensions/bifrost-jupyter/`, plus the server-extension
+config drop-in under `etc/jupyter/jupyter_server_config.d/`. Verify with:
+
+```bash
+jupyter server extension list   # bifrost_jupyter  enabled  ... OK
+jupyter labextension list       # bifrost-jupyter v0.1.0 enabled OK (python, bifrost_jupyter)
+```
+
+A fresh install with no Bifrost configured is a supported state: the panel shows
+a plain "not configured" note rather than an error. Point it at a control plane
+by setting `BIFROST_API_URL` and a credential (see
+[Authentication](#authentication)).
+
 The kernel-side helper (`from bifrost_jupyter import connect`) additionally
 needs Ray, kept as an optional extra so it does not bloat the server env:
 
 ```bash
 pip install "bifrost_jupyter[kernel]"
 ```
+
+## Acceptance
+
+[`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md) records the end-to-end acceptance
+loop — start → status → connect cell → job with env vars → stop — run against a
+dev Bifrost **with authentication enforced**, plus the live checks for the
+operator-role prerequisite and credential expiry. It also lists what is
+deliberately left to a manual Nebari + Keycloak gate (OIDC passthrough,
+owner-match, the in-cluster Ray paths) and why.
 
 ## Uninstall
 
