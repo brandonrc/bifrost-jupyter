@@ -88,12 +88,22 @@ class _BifrostHandler(_ClusterIdMixin, APIHandler):
         exactly like ``POST /clusters`` — an unconfigured extension maps to a clean
         409 logged at *warning* (never a 5xx / error-level ServerApp log), rather
         than the graceful ``configured:false`` 200 the load-time GET poll uses.
+
+        A credential that *is* configured but cannot be made usable (an expired
+        OIDC token with no refresh path, an unreachable IdP) is a different
+        answer: :class:`BifrostAPIError` already carries the status and an
+        actionable message, so it is relayed rather than flattened into
+        "not configured".
         """
         try:
             return self._client()
         except BifrostConfigError:
             self.log.warning("bifrost: %s requested but extension is not configured", action)
             self._fail(409, "bifrost not configured")
+            return None
+        except BifrostAPIError as exc:
+            self.log.warning("bifrost: %s blocked by a credential problem", action)
+            self._fail(exc.status, exc.message)
             return None
 
     def _allowlist(self):
@@ -135,6 +145,13 @@ class ClustersHandler(_BifrostHandler):
             # instead; the panel renders a friendly note and backs off polling.
             self.finish(json.dumps({"clusters": [], "configured": False}))
             return
+        except BifrostAPIError as exc:
+            # Configured, but the credential could not be made usable. That is a
+            # real failure with an actionable message (an expired OIDC token, an
+            # IdP that will not answer) — showing it is the whole point of the
+            # refresh path, so it must not be swallowed as "unconfigured".
+            self._fail(exc.status, exc.message)
+            return
 
         try:
             views = client.list_clusters()
@@ -147,14 +164,11 @@ class ClustersHandler(_BifrostHandler):
 
     @tornado.web.authenticated
     def post(self) -> None:
-        try:
-            client = self._client()
-        except BifrostConfigError:
-            # A start is a deliberate user action, not a page-load poll, so a
-            # clean 4xx (logged at warning, not error) is the right answer when
-            # Bifrost is not configured.
-            self.log.warning("bifrost: start requested but extension is not configured")
-            self._fail(409, "bifrost not configured")
+        # A start is a deliberate user action, not a page-load poll, so an
+        # unconfigured extension is a clean 4xx (logged at warning, not error),
+        # and a credential problem is relayed with its actionable message.
+        client = self._write_client_or_fail("start")
+        if client is None:
             return
 
         try:

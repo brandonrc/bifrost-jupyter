@@ -17,10 +17,143 @@ preconfigured Ray `JobSubmissionClient` pointed at the cluster's **in-cluster
 head service** (`http://<id>-head-svc.<namespace>.svc:8265`) — not a Bifrost
 gateway host, per the design §2 amendment.
 
-> **Status:** scaffold only. This repo currently contains the
-> `frontend-and-server` extension skeleton with dependencies, CI, and packaging
-> wired up. Feature logic (cluster start/stop, profiles, the connect helper)
-> lands in follow-up tasks.
+## Authentication
+
+The extension never puts a credential in the browser. The Python server
+extension resolves one inside the user's notebook pod and attaches it as
+`Authorization: Bearer …` on **Bifrost control-plane calls only** (start, list,
+stop, suspend, resume). The in-cluster paths — job submit, job status, the
+dashboard proxy — deliberately carry no credential at all; see the sections
+below.
+
+### Credential precedence
+
+Highest first. The first one that resolves wins:
+
+| #   | Source                                                                   | Environment                                                                                                                                 |
+| --- | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | OIDC access token injected by JupyterHub's `auth_state` hook             | `BIFROST_OIDC_TOKEN_FILE`, else `BIFROST_OIDC_TOKEN`, else `ACCESS_TOKEN`                                                                   |
+| 2   | …renewed at the IdP when it has expired (`grant_type=refresh_token`)     | `BIFROST_OIDC_REFRESH_TOKEN_FILE` / `BIFROST_OIDC_REFRESH_TOKEN` + `BIFROST_OIDC_TOKEN_URL`                                                 |
+| 3   | …exchanged for a Bifrost-audience token (RFC 8693) when audiences differ | `BIFROST_OIDC_AUDIENCE` (+ `BIFROST_OIDC_TOKEN_URL`, `BIFROST_OIDC_CLIENT_ID`, `BIFROST_OIDC_CLIENT_SECRET`, optional `BIFROST_OIDC_SCOPE`) |
+| 4   | …traded once per session for a Bifrost PAT — **opt-in, off by default**  | `BIFROST_MINT_PAT=1` (+ `BIFROST_PAT_TTL_DAYS`, default 1, capped at Bifrost's 90)                                                          |
+| 5   | Dev / non-Hub fallback: a pasted `mob_` PAT                              | `BIFROST_TOKEN`                                                                                                                             |
+
+Plus `BIFROST_API_URL`, the Bifrost control-plane base URL, which is required in
+every case. With none of the credential variables set the extension reports
+itself as _not configured_ — a normal state for a bare install — and the panel
+shows a plain note rather than an error.
+
+**OIDC beats the dev PAT.** If both are present the OIDC token is used, because
+it is the identity that has to match the pod's owner label (below). Prefer the
+`…_FILE` forms: an environment variable is frozen at spawn time, so only a file
+can be rotated under a long-running session.
+
+The token endpoint must be `https://` — the exchange sends the user's live
+credential in the request body and receives a bearer in the response.
+
+### Deployment prerequisite: `auth_state` injection (Nebari / JupyterHub)
+
+This is **deployment configuration, not code**, and it is off by default in
+JupyterHub. Without it there is no OIDC token in the pod and the extension falls
+back to `BIFROST_TOKEN`.
+
+```python
+# jupyterhub_config.py (Nebari: the equivalent stanza in nebari-config.yaml's
+# jupyterhub.overrides / hub.extraConfig)
+c.Authenticator.enable_auth_state = True
+
+async def bifrost_auth_state_hook(spawner, auth_state):
+    if not auth_state:
+        return
+    spawner.environment["BIFROST_OIDC_TOKEN"] = auth_state["access_token"]
+    # Optional, but this is what lets a long session survive token expiry:
+    if auth_state.get("refresh_token"):
+        spawner.environment["BIFROST_OIDC_REFRESH_TOKEN"] = auth_state["refresh_token"]
+        spawner.environment["BIFROST_OIDC_TOKEN_URL"] = (
+            "https://<keycloak>/realms/<realm>/protocol/openid-connect/token"
+        )
+        spawner.environment["BIFROST_OIDC_CLIENT_ID"] = "<hub client id>"
+
+c.Spawner.auth_state_hook = bifrost_auth_state_hook
+c.Spawner.environment.update({"BIFROST_API_URL": "https://<bifrost>"})
+```
+
+`enable_auth_state` also requires `JUPYTERHUB_CRYPT_KEY` to be set on the hub;
+JupyterHub refuses to start with auth state enabled and no key.
+
+### Prerequisite: the notebook user's role must grant cluster Write
+
+Creating a cluster is `Write` on target `cluster` in Bifrost's RBAC, which only
+the **operator** (or admin) role grants — `developer` and `viewer` get a `403`.
+A Nebari notebook user's token must therefore carry operator, mapped from an IdP
+group in Bifrost's auth config:
+
+```json
+{
+  "issuer": "https://<keycloak>/realms/<realm>",
+  "audience": "bifrost",
+  "groups_claim": "groups",
+  "roles": { "operator": ["/analysts"] },
+  "project_roles": { "operator": ["*"], "strip_prefix": "/" }
+}
+```
+
+`roles.operator` grants it globally to members of the listed groups;
+`project_roles.operator` is the self-service form — a member of group `team-a`
+gets operator scoped to `project:team-a`. Note the extension's profiles stamp a
+fixed project (`BIFROST_PROJECT`, default `jupyter`), so with `project_roles`
+that project name must match a group the user is in.
+
+Without this mapping the extension is unusable, so the panel says so instead of
+showing a bare "forbidden": a 403 on a lifecycle action reports that cluster
+lifecycle needs the operator role and that an admin must map the group.
+
+### The owner-match caveat
+
+Bifrost stamps `ClusterSpec.owner` from the **request identity** —
+`preferred_username` when the token carries one, else `sub` — and the per-owner
+NetworkPolicy admits only the pod labeled `bifrost.dev/owner: <that owner>` to
+the cluster's `:8265` (Jobs API + dashboard) and `:10001` (Ray Client). So **the
+identity the extension presents must equal the identity that labels the notebook
+pod**. OIDC passthrough is what guarantees that: the token is the user's own, so
+`preferred_username` is the JupyterHub username the spawner labels the pod with.
+
+If they diverge, the failure is quiet and confusing: the control plane still
+works (clusters start, stop and list normally) while every in-cluster call —
+job submit, job status, the dashboard — times out or is refused, because the
+NetworkPolicy is keyed on an owner the pod does not carry. With the dev
+`mob_` PAT this is the expected state whenever the PAT's subject is not the
+notebook user.
+
+### Why the session PAT mint is opt-in
+
+The design called for minting a longer-lived Bifrost PAT at session start
+(`POST /api/v1/auth/tokens`) and using it thereafter. Verified against the
+Bifrost source, that is not usable on the production OIDC path:
+
+- `CreateToken` calls `requireLocal()` first, so on an OIDC-only deployment (no
+  `--local-auth`) it answers `404 local auth is not enabled`;
+- with local auth enabled it mints via `IssueToken(identity.Subject, …)`, which
+  requires a **local user row** whose username equals the OIDC `sub` (a Keycloak
+  UUID) — absent, that is a `500`;
+- and where such a row does exist, the resulting PAT authenticates as that local
+  user, whose owner is the `sub`, not `preferred_username`. Using it would
+  re-label new clusters with the UUID and silently break the owner match
+  described above. Group-derived project roles are lost too, since local
+  identities carry none.
+
+So the OIDC path keeps the OIDC identity and handles lifetime by refreshing it.
+`BIFROST_MINT_PAT=1` enables the mint for deployments where Bifrost's identity
+for the PAT _is_ the pod owner; a mint that fails degrades to the OIDC token
+with a warning rather than ending the session.
+
+### Expiry is refreshed, never surfaced as a mystery 401
+
+A credential is re-resolved when it is within 60s of expiry, and a `401` from
+Bifrost triggers exactly one refresh-and-retry. When a refresh is impossible —
+an expired access token with no refresh token in the pod — the panel gets a
+`401` that says the token expired and what to do about it, not a bare
+"unauthorized" or an unhandled 500.
 
 ## Submitting jobs with environment variables
 
