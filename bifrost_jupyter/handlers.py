@@ -219,8 +219,17 @@ def _create_and_read(client, body):
 
 
 def _observed_state(view) -> str:
-    """The coarse, safe state for a cluster view: observed, else desired."""
-    return view.observed_state or view.desired or "pending"
+    """The coarse, safe state for a cluster view: what is, never what was asked for.
+
+    Only the *observed* state is presented. Falling back to ``desired`` used to
+    make a cluster that had just been requested read as ``running``, and the
+    panel gates its controls on exactly that string
+    (``cluster.state === 'running'`` in BifrostPanel.ts): Suspend, Stop and
+    Submit came alive for a cluster that was still coming up, so the first
+    click answered 409 Conflict with nothing a user could act on. A cluster
+    with no observed state yet is ``pending`` — which is what it is.
+    """
+    return view.observed_state or "pending"
 
 
 class ClustersHandler(_BifrostHandler):

@@ -1,3 +1,5 @@
+import os
+
 import pytest
 
 from bifrost_jupyter import _credentials
@@ -37,16 +39,33 @@ _CREDENTIAL_ENV_VARS = (
 )
 
 
+#: The credential environment as the process started, captured before any test
+#: can clear it. Live tests are handed this back; see below.
+_AMBIENT_ENV = {var: os.environ.get(var) for var in _CREDENTIAL_ENV_VARS}
+
+
 @pytest.fixture(autouse=True)
-def clean_credential_env(monkeypatch):
+def clean_credential_env(monkeypatch, request):
     """A clean credential environment and a fresh session resolver per test.
 
     The resolver is process-wide on purpose (the session-start exchange/mint must
     happen once, not per request), so it has to be reset between tests or one
     test's cached credential leaks into the next.
+
+    A test marked ``live`` is the exception, and has to be: it exists to drive a
+    real Bifrost, which it can only do with the environment the developer or CI
+    set. Scrubbing it there made every live test answer "not configured" — a
+    409 that reads like a product bug and is really this fixture. So those tests
+    get the ambient environment restored rather than removed, and everything
+    else keeps the hermetic default.
     """
+    live = request.node.get_closest_marker("live") is not None
     for var in _CREDENTIAL_ENV_VARS:
-        monkeypatch.delenv(var, raising=False)
+        ambient = _AMBIENT_ENV.get(var)
+        if live and ambient is not None:
+            monkeypatch.setenv(var, ambient)
+        else:
+            monkeypatch.delenv(var, raising=False)
     _credentials.reset_session()
     yield
     _credentials.reset_session()

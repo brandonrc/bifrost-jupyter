@@ -100,11 +100,18 @@ async def test_post_clusters_returns_id_and_status(jp_fetch, patch_client):
     assert TOKEN not in resp.body.decode()
 
 
-async def test_post_clusters_falls_back_to_desired_state(jp_fetch, patch_client):
+async def test_post_clusters_reports_pending_until_the_cluster_is_observed(jp_fetch, patch_client):
+    """A requested cluster is pending, not running.
+
+    The panel enables Suspend, Stop and Submit on `state === 'running'`, so
+    answering with the desired state made those controls live while the cluster
+    was still provisioning — and the control plane then answered 409 on the
+    first click. Caught by the live suite against grace.
+    """
     view = SimpleNamespace(observed_state=None, desired="running")
     patch_client(FakeClient(view=view))
     resp = await jp_fetch("bifrost", "clusters", method="POST", body='{"profile": "small"}')
-    assert json.loads(resp.body)["status"] == "running"
+    assert json.loads(resp.body)["status"] == "pending"
 
 
 async def test_post_clusters_maps_conflict(jp_fetch, patch_client):
