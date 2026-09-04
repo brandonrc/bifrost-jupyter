@@ -33,10 +33,11 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from bifrost_client import ApiException, ClustersApi, Configuration
+from bifrost_client import AccessApi, ApiException, ClustersApi, Configuration
 from bifrost_client.models.cluster_view import ClusterView
 from bifrost_client.models.create_cluster import CreateCluster
 
+from . import _projects
 from ._apiclient import DEFAULT_TIMEOUT_SECONDS, bounded_api_client
 from ._credentials import (
     BifrostConfigError,
@@ -154,7 +155,34 @@ class BifrostClient:
         self._config = Configuration(host=api_url, access_token=source.get())
         # Bounded at the chokepoint, so this and every future endpoint wrapper
         # is timeout-safe without each call site remembering (see ._apiclient).
-        self._clusters = ClustersApi(bounded_api_client(self._config, timeout))
+        client = bounded_api_client(self._config, timeout)
+        self._clusters = ClustersApi(client)
+        # Identity is read through the same bounded client, but as raw bytes:
+        # the pinned SDK's IdentityResponse predates the `projects` field and
+        # pydantic drops unknown fields, so a model round-trip would lose the
+        # one thing the caller needs (see ._projects).
+        self._access = AccessApi(client)
+
+    def identity(self) -> dict | None:
+        """The caller's identity as Bifrost reports it, or ``None`` if unreadable.
+
+        Used to learn which projects the caller may start clusters in, so the
+        panel never has to guess one. Raw rather than modelled — see the note
+        in the constructor — and failure is soft: a client that cannot read its
+        identity still starts clusters when the project is set another way, so
+        this returns ``None`` rather than raising.
+        """
+        try:
+            resp = self._call_access("identity_without_preload_content")
+        except BifrostAPIError:
+            raise
+        except Exception:  # noqa: BLE001 - a malformed identity must not break start
+            return None
+        return _projects.parse_identity(getattr(resp, "data", None))
+
+    def _call_access(self, name: str, *args: Any) -> Any:
+        """``_call`` for ``AccessApi``, with the same 401 refresh."""
+        return self._call(name, *args, _api=self._access)
 
     def _refresh_credential(self) -> bool:
         """Re-resolve the credential. ``False`` if this source cannot refresh."""
@@ -169,18 +197,23 @@ class BifrostClient:
             raise BifrostAPIError(401, _STALE_CREDENTIAL_MESSAGE) from None
         return True
 
-    def _call(self, name: str, *args: Any, forbidden: str | None = None) -> Any:
-        """Invoke ``ClustersApi.<name>``, refreshing the credential once on 401.
+    def _call(
+        self, name: str, *args: Any, forbidden: str | None = None, _api: Any = None
+    ) -> Any:
+        """Invoke ``<api>.<name>``, refreshing the credential once on 401.
 
-        The method is looked up by name on each attempt so the retry re-enters
-        the same call site (and so tests can substitute one).
+        ``_api`` defaults to the clusters API, which is what almost every call
+        here wants; identity goes through the access API. The method is looked
+        up by name on each attempt so the retry re-enters the same call site
+        (and so tests can substitute one).
         """
+        api = self._clusters if _api is None else _api
         for attempt in (0, 1):
             try:
                 # No per-call timeout argument by design: the client this is
                 # bound to supplies one for every request (see ._apiclient), so a
                 # new endpoint wrapper cannot forget it.
-                return getattr(self._clusters, name)(*args)
+                return getattr(api, name)(*args)
             except ApiException as exc:
                 if exc.status == 401:
                     if attempt == 0 and self._refresh_credential():

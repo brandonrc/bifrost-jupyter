@@ -8,7 +8,7 @@ from bifrost_jupyter import _profiles
 
 
 def test_small_profile_maps_to_create_cluster():
-    body = _profiles.build_create_cluster(_profiles.SMALL)
+    body = _profiles.build_create_cluster(_profiles.SMALL, project="team-a")
 
     assert body.id
     assert body.id == body.spec.name  # id is the RayCluster name / routing key
@@ -24,46 +24,59 @@ def test_small_profile_maps_to_create_cluster():
 def test_ttl_seconds_is_set():
     # Interactive clusters submit no gateway jobs, so idle_timeout can't reap
     # them — ttl_seconds is the only reaper that can. It must be set.
-    body = _profiles.build_create_cluster(_profiles.SMALL)
+    body = _profiles.build_create_cluster(_profiles.SMALL, project="team-a")
     assert body.spec.ttl_seconds is not None
     assert body.spec.ttl_seconds > 0
 
 
 def test_owner_is_not_set():
     # owner is stamped control-plane-side from the token, never from the body.
-    body = _profiles.build_create_cluster(_profiles.SMALL)
+    body = _profiles.build_create_cluster(_profiles.SMALL, project="team-a")
     assert body.spec.owner is None
     # And it must not appear in the serialized wire body either.
     assert "owner" not in body.spec.to_dict()
 
 
 def test_ids_are_unique_per_call():
-    a = _profiles.build_create_cluster(_profiles.SMALL)
-    b = _profiles.build_create_cluster(_profiles.SMALL)
+    a = _profiles.build_create_cluster(_profiles.SMALL, project="team-a")
+    b = _profiles.build_create_cluster(_profiles.SMALL, project="team-a")
     assert a.id != b.id
 
 
 def test_explicit_cluster_id_is_honored():
-    body = _profiles.build_create_cluster(_profiles.SMALL, cluster_id="fixed-id")
+    body = _profiles.build_create_cluster(_profiles.SMALL, cluster_id="fixed-id", project="team-a")
     assert body.id == "fixed-id"
     assert body.spec.name == "fixed-id"
 
 
-def test_project_from_env(monkeypatch):
+def test_the_project_is_the_one_passed_in(monkeypatch):
+    """The builder uses the project it is given and consults nothing else.
+
+    It used to read BIFROST_PROJECT here and fall back to a hardcoded
+    "jupyter", which put the decision — and its default — out of reach of the
+    handler that has to explain it. Resolution now lives in `_projects`, which
+    is where the environment is read; this layer only builds a body.
+    """
     monkeypatch.setenv("BIFROST_PROJECT", "team-x")
-    body = _profiles.build_create_cluster(_profiles.SMALL)
-    assert body.spec.project == "team-x"
+    body = _profiles.build_create_cluster(_profiles.SMALL, project="team-a")
+    assert body.spec.project == "team-a"
+
+
+def test_a_body_without_a_project_is_refused():
+    """No default: a missing project is a programming error, not a guess."""
+    with pytest.raises(ValueError, match="needs a project"):
+        _profiles.build_create_cluster(_profiles.SMALL)
 
 
 def test_unknown_profile_raises():
     with pytest.raises(KeyError):
-        _profiles.build_create_cluster("enormous")
+        _profiles.build_create_cluster("enormous", project="team-a")
 
 
 def test_unknown_profile_raises_unknown_profile_error():
     # A clear, typed error — not a default fallback.
     with pytest.raises(_profiles.UnknownProfileError) as exc:
-        _profiles.profile_to_spec("enormous")
+        _profiles.profile_to_spec("enormous", project="team-a")
     assert "unknown profile" in str(exc.value)
     assert "enormous" in str(exc.value)
 
@@ -73,7 +86,7 @@ def test_unknown_profile_raises_unknown_profile_error():
 
 @pytest.mark.parametrize("name", sorted(_profiles.DEFAULT_PROFILES))
 def test_every_profile_sets_ttl_and_omits_owner(name):
-    body = _profiles.profile_to_spec(name)
+    body = _profiles.profile_to_spec(name, project="team-a")
     assert body.spec.ttl_seconds is not None and body.spec.ttl_seconds > 0
     assert body.spec.owner is None
     assert "owner" not in body.spec.to_dict()
@@ -81,7 +94,7 @@ def test_every_profile_sets_ttl_and_omits_owner(name):
 
 @pytest.mark.parametrize("name", sorted(_profiles.DEFAULT_PROFILES))
 def test_every_profile_maps_to_valid_body(name):
-    body = _profiles.profile_to_spec(name)
+    body = _profiles.profile_to_spec(name, project="team-a")
     assert body.id == body.spec.name
     assert body.spec.image and body.spec.ray_version
     assert body.spec.head_cpu and body.spec.head_memory
@@ -118,7 +131,7 @@ def test_gpu_profile_view_reports_gpu_count():
 
 def test_generated_ids_stay_within_length_bound():
     for name in _profiles.DEFAULT_PROFILES:
-        assert len(_profiles.profile_to_spec(name).id) <= _profiles._MAX_ID_LEN
+        assert len(_profiles.profile_to_spec(name, project="team-a").id) <= _profiles._MAX_ID_LEN
 
 
 def test_long_profile_name_id_is_bounded_and_dns_safe():
@@ -141,7 +154,7 @@ def test_long_profile_name_id_is_bounded_and_dns_safe():
             ),
         )
     }
-    cid = _profiles.profile_to_spec(long_name, profiles).id
+    cid = _profiles.profile_to_spec(long_name, profiles, project="team-a").id
     assert len(cid) <= _profiles._MAX_ID_LEN
     assert cid.startswith("jl-")
 
@@ -207,7 +220,7 @@ def test_resolve_profiles_defaults_ttl_and_ignores_owner():
         ]
     )
     assert resolved["nottl"].ttl_seconds == _profiles._DEFAULT_TTL_SECONDS
-    body = _profiles.profile_to_spec("nottl", resolved)
+    body = _profiles.profile_to_spec("nottl", resolved, project="team-a")
     assert body.spec.ttl_seconds == _profiles._DEFAULT_TTL_SECONDS
     assert body.spec.owner is None  # 'owner' in config never reaches the spec
 

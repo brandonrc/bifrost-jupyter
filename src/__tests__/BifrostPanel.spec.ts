@@ -20,6 +20,7 @@ const insertBelow = NotebookActions.insertBelow as jest.MockedFunction<
   typeof NotebookActions.insertBelow
 >;
 
+const getProject = api.getProject as jest.MockedFunction<typeof api.getProject>;
 const listProfiles = api.listProfiles as jest.MockedFunction<
   typeof api.listProfiles
 >;
@@ -84,6 +85,16 @@ describe('BifrostPanel', () => {
 
   beforeEach(() => {
     listProfiles.mockReset();
+    // The ordinary case: the server settled the project, so the panel shows it
+    // and sends nothing. Tests that care override this.
+    getProject.mockReset();
+    getProject.mockResolvedValue({
+      configured: true,
+      project: 'team-a',
+      projects: ['team-a'],
+      note: null,
+      source: 'identity'
+    });
     listClusters.mockReset();
     createCluster.mockReset();
     stopCluster.mockReset();
@@ -241,7 +252,86 @@ describe('BifrostPanel', () => {
     await flush();
 
     expect(createCluster).toHaveBeenCalledTimes(1);
-    expect(createCluster).toHaveBeenCalledWith(expect.anything(), 'small');
+    // No project argument: the server settled it, and sending one back would
+    // let a stale panel start somewhere the user has since lost access to.
+    expect(createCluster).toHaveBeenCalledWith(
+      expect.anything(),
+      'small',
+      undefined
+    );
+  });
+
+  it('shows the project a start will land in', async () => {
+    listProfiles.mockResolvedValue([SMALL]);
+    listClusters.mockResolvedValue({ clusters: [], configured: true });
+    panel = new BifrostPanel(settings());
+    Widget.attach(panel, document.body);
+    await flush();
+
+    const label = panel.node.querySelector('.jp-BifrostPanel-project');
+    expect(label).not.toBeNull();
+    expect((label as HTMLElement).hidden).toBe(false);
+    expect(label!.textContent).toContain('team-a');
+  });
+
+  it('offers a choice, and sends it, when the user holds several projects', async () => {
+    listProfiles.mockResolvedValue([SMALL]);
+    listClusters.mockResolvedValue({ clusters: [], configured: true });
+    getProject.mockResolvedValue({
+      configured: true,
+      project: null,
+      projects: ['team-a', 'team-b'],
+      note: 'choose which project to start in',
+      source: 'unresolved'
+    });
+    createCluster.mockResolvedValue({ id: 'jl-small-1', status: 'pending' });
+    panel = new BifrostPanel(settings());
+    Widget.attach(panel, document.body);
+    await flush();
+
+    const selects = panel.node.querySelectorAll('select');
+    const projectSelect = selects[1] as HTMLSelectElement;
+    expect(projectSelect.hidden).toBe(false);
+    expect(
+      Array.from(projectSelect.options).map(o => o.value)
+    ).toEqual(['', 'team-a', 'team-b']);
+
+    // Start stays disabled until the project is picked: a start without one
+    // answers 409, which the user cannot act on from here.
+    selectEl().value = 'small';
+    selectEl().dispatchEvent(new Event('change'));
+    expect(startButton().disabled).toBe(true);
+
+    projectSelect.value = 'team-b';
+    projectSelect.dispatchEvent(new Event('change'));
+    expect(startButton().disabled).toBe(false);
+
+    startButton().click();
+    await flush();
+    expect(createCluster).toHaveBeenCalledWith(
+      expect.anything(),
+      'small',
+      'team-b'
+    );
+  });
+
+  it('says why when the user holds no project at all', async () => {
+    listProfiles.mockResolvedValue([SMALL]);
+    listClusters.mockResolvedValue({ clusters: [], configured: true });
+    getProject.mockResolvedValue({
+      configured: true,
+      project: null,
+      projects: [],
+      note: 'your account holds no project it may start clusters in',
+      source: 'unresolved'
+    });
+    panel = new BifrostPanel(settings());
+    Widget.attach(panel, document.body);
+    await flush();
+
+    const message = panel.node.querySelector('.jp-BifrostPanel-message');
+    expect(message).not.toBeNull();
+    expect(message!.textContent).toContain('no project');
   });
 
   async function attachedWith(

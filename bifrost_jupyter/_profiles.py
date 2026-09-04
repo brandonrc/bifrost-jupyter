@@ -31,7 +31,6 @@ Left as a follow-up.
 
 from __future__ import annotations
 
-import os
 import re
 import uuid
 from collections.abc import Iterable
@@ -45,9 +44,6 @@ from bifrost_client.models.worker_group import WorkerGroup
 # for callers that don't specify one).
 SMALL = "small"
 
-# Default project when BIFROST_PROJECT is unset. `project` is a required
-# ClusterSpec field; it is not an identity claim, so a client-side default is fine.
-_DEFAULT_PROJECT = "jupyter"
 
 # 1 hour absolute cap: interactive clusters must be reaped even while "idle".
 # Used as the fallback when a config profile omits ttl_seconds (keeping the
@@ -267,12 +263,19 @@ def profile_to_spec(
     profiles: dict[str, Profile] | None = None,
     *,
     cluster_id: str | None = None,
+    project: str | None = None,
 ) -> CreateCluster:
     """Map an approved profile *name* to a ``CreateCluster`` request body.
 
     Raises :class:`UnknownProfileError` for a name not in the allowlist — never
     falls back to a default. The client supplies only the name; every spec field
     comes from the approved profile.
+
+    ``project`` is settled by the caller (``_projects.resolve``) and passed in.
+    It used to be read here, straight from the environment with a hardcoded
+    fallback, which is how a cluster came to be requested in a project the user
+    had no grant in; deciding it here also hid the decision from the handler
+    that has to explain it.
     """
     profiles = profiles if profiles is not None else DEFAULT_PROFILES
     try:
@@ -281,7 +284,8 @@ def profile_to_spec(
         raise UnknownProfileError(name, profiles.keys()) from None
 
     cluster_id = cluster_id or _generate_id(name)
-    project = os.environ.get("BIFROST_PROJECT") or _DEFAULT_PROJECT
+    if not project:
+        raise ValueError("profile_to_spec needs a project; resolve one first")
 
     spec = ClusterSpec(
         name=cluster_id,
@@ -308,13 +312,15 @@ def profile_to_spec(
     return CreateCluster(id=cluster_id, spec=spec)
 
 
-def build_create_cluster(profile: str = SMALL, *, cluster_id: str | None = None) -> CreateCluster:
+def build_create_cluster(
+    profile: str = SMALL, *, cluster_id: str | None = None, project: str | None = None
+) -> CreateCluster:
     """Backward-compatible wrapper mapping a default-set profile to a body.
 
     Prefer :func:`profile_to_spec`, which accepts a deployment-configured
     allowlist. Retained for callers pinned to the built-in defaults.
     """
-    return profile_to_spec(profile, DEFAULT_PROFILES, cluster_id=cluster_id)
+    return profile_to_spec(profile, DEFAULT_PROFILES, cluster_id=cluster_id, project=project)
 
 
 _REQUIRED_PROFILE_KEYS = ("name", "image", "ray_version", "head_cpu", "head_memory")

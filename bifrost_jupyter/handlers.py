@@ -34,7 +34,7 @@ from jupyter_server.base.handlers import APIHandler, JupyterHandler
 from jupyter_server.utils import url_path_join
 from tornado.ioloop import IOLoop
 
-from . import _address, _dashboard, _jobs, _profiles
+from . import _address, _dashboard, _jobs, _profiles, _projects
 from .bifrost import BifrostAPIError, BifrostConfigError, client_from_env
 from .config import default_namespace
 
@@ -204,12 +204,67 @@ class _BifrostHandler(_ClusterIdMixin, APIHandler):
 
 
 class ProfilesHandler(_BifrostHandler):
-    """``GET /bifrost/profiles`` — the safe allowlist view (no manifest surface)."""
+    """``GET /bifrost/profiles`` — the safe allowlist view (no manifest surface).
+
+    Deliberately local and instant: the allowlist is deployment configuration,
+    so this route makes no Bifrost call and does no credential work. That is a
+    property worth keeping — the panel paints its profile list on load, and a
+    slow IdP must not delay it. *Where* a start would land is a network fact
+    and lives on its own route (:class:`ProjectHandler`).
+    """
 
     @tornado.web.authenticated
     def get(self) -> None:
         views = _profiles.list_profiles(self._allowlist())
         self.finish(json.dumps({"profiles": [v.to_dict() for v in views]}))
+
+
+class ProjectHandler(_BifrostHandler):
+    """``GET /bifrost/project`` — which project a start would land in.
+
+    Answers with the project settled for this caller, the projects they could
+    choose between, and a note when none is settled. The panel shows it before
+    the Start click, which is the point: a project nobody chose used to become
+    a 403 that read as a missing permission (bifrost-jupyter#3).
+
+    An unconfigured extension answers 200 with `configured: false`, matching
+    the cluster list's load-time poll rather than erroring on a bare install.
+    """
+
+    @tornado.web.authenticated
+    async def get(self) -> None:
+        try:
+            client = await self._client()
+        except BifrostConfigError:
+            self.finish(json.dumps({"configured": False}))
+            return
+        except BifrostAPIError as exc:
+            self._fail(exc.status, exc.message)
+            return
+        resolution = await _resolve_project_for(self, client)
+        self.finish(
+            json.dumps(
+                {
+                    "configured": True,
+                    "project": resolution.project,
+                    "projects": resolution.candidates,
+                    "note": resolution.message,
+                    "source": resolution.source,
+                }
+            )
+        )
+
+
+async def _resolve_project_for(handler, client, requested: str | None = None):
+    """The project a start should use for this caller, or why there is none.
+
+    Identity is one blocking call, so it goes through the handler's pool like
+    every other one. A caller whose identity cannot be read is not an error:
+    `_projects.resolve` treats a silent server as "name it yourself" and says
+    so in the message.
+    """
+    identity = await handler._blocking(client.identity)
+    return _projects.resolve(identity, requested=requested)
 
 
 def _create_and_read(client, body):
@@ -297,8 +352,33 @@ class ClustersHandler(_BifrostHandler):
             self._fail(400, "invalid 'profile'")
             return
 
+        requested = payload.get("project")
+        if requested is not None and not isinstance(requested, str):
+            self._fail(400, "invalid 'project'")
+            return
+        resolution = await _resolve_project_for(self, client, requested)
+        if resolution.project is None:
+            # 409, not 403: nothing was refused. Either the caller has to pick
+            # (the panel offers `projects`) or an operator has to grant or set
+            # one — and the message says which, rather than leaving Bifrost to
+            # answer "insufficient permission" about a project that was never
+            # the caller's (bifrost-jupyter#3).
+            self.set_status(409)
+            self.finish(
+                json.dumps(
+                    {
+                        "error": "project not settled",
+                        "message": resolution.message or "no project available",
+                        "projects": resolution.candidates,
+                    }
+                )
+            )
+            return
+
         try:
-            body = _profiles.profile_to_spec(name, self._allowlist())
+            body = _profiles.profile_to_spec(
+                name, self._allowlist(), project=resolution.project
+            )
         except _profiles.UnknownProfileError as exc:
             self._fail(400, str(exc))
             return
@@ -588,6 +668,7 @@ def setup_handlers(web_app, namespace: str | None = None, profiles=None) -> None
     web_app.settings["bifrost_profiles"] = profiles or _profiles.DEFAULT_PROFILES
 
     profiles_url = url_path_join(base_url, "bifrost", "profiles")
+    project_url = url_path_join(base_url, "bifrost", "project")
     clusters = url_path_join(base_url, "bifrost", "clusters")
     # Each pattern is anchored with ``$`` by tornado, and ``([^/]+)`` never spans a
     # slash, so ``/clusters/{id}``, ``/clusters/{id}/address``,
@@ -609,6 +690,7 @@ def setup_handlers(web_app, namespace: str | None = None, profiles=None) -> None
         host_pattern,
         [
             (profiles_url, ProfilesHandler),
+            (project_url, ProjectHandler),
             (clusters, ClustersHandler),
             (address, ClusterAddressHandler),
             (lifecycle, ClusterLifecycleHandler),

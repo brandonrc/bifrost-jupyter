@@ -29,6 +29,17 @@ from bifrost_jupyter.tests.test_credentials import make_jwt
 TOKEN = "bfr_supersecrettoken"
 
 
+#: The identity a fake client reports unless a test says otherwise: one
+#: project, held as operator, which is the ordinary case — a notebook user with
+#: a grant on their team's project.
+DEFAULT_IDENTITY = {
+    "subject": "alice",
+    "groups": [],
+    "roles": ["developer"],
+    "projects": [{"name": "team-a", "roles": ["operator"]}],
+}
+
+
 class FakeClient:
     def __init__(
         self,
@@ -38,12 +49,14 @@ class FakeClient:
         clusters=None,
         list_error=None,
         action_error=None,
+        identity=DEFAULT_IDENTITY,
     ):
         self._view = view
         self._create_error = create_error
         self._clusters = clusters or []
         self._list_error = list_error
         self._action_error = action_error
+        self._identity = identity
         self.created = None
         # (op_name, cluster_id) recorded for each lifecycle call.
         self.actions = []
@@ -55,6 +68,9 @@ class FakeClient:
 
     def get_cluster(self, cluster_id):
         return self._view
+
+    def identity(self):
+        return self._identity
 
     def list_clusters(self):
         if self._list_error:
@@ -813,6 +829,11 @@ class SlowClient:
     def __init__(self, entered):
         self._entered = entered
 
+    def identity(self):
+        # Answers at once: this stub exists to make one *chosen* call slow, and
+        # a slow identity on every route would test the pool, not the route.
+        return DEFAULT_IDENTITY
+
     def list_clusters(self):
         self._entered.set()
         time.sleep(SLOW_CALL_SECONDS)
@@ -988,3 +1009,118 @@ async def test_the_pool_is_not_the_event_loops_default(jp_fetch, monkeypatch):
         "whole jupyter-server process, not to this extension"
     )
     assert submitted, "the recording executor was never consulted; the test proves nothing"
+
+
+# --- which project a start lands in (bifrost-jupyter#3) ---------------------
+
+
+async def test_project_route_reports_the_resolved_project(jp_fetch, patch_client):
+    patch_client(FakeClient())
+    resp = await jp_fetch("bifrost", "project")
+    assert resp.code == 200
+    payload = json.loads(resp.body)
+    assert payload == {
+        "configured": True,
+        "project": "team-a",
+        "projects": ["team-a"],
+        "note": None,
+        "source": "identity",
+    }
+
+
+async def test_project_route_offers_a_choice_when_there_are_several(jp_fetch, patch_client):
+    patch_client(
+        FakeClient(
+            identity={
+                "subject": "alice",
+                "groups": [],
+                "roles": ["developer"],
+                "projects": [
+                    {"name": "team-b", "roles": ["operator"]},
+                    {"name": "team-a", "roles": ["operator"]},
+                ],
+            }
+        )
+    )
+    payload = json.loads((await jp_fetch("bifrost", "project")).body)
+    assert payload["project"] is None
+    assert payload["projects"] == ["team-a", "team-b"]
+    assert "choose" in payload["note"]
+
+
+async def test_project_route_on_a_bare_install_is_not_an_error(jp_fetch, monkeypatch):
+    """A bare install answers `configured: false`, like the cluster list's poll."""
+    monkeypatch.setattr(
+        handlers, "client_from_env", lambda: (_ for _ in ()).throw(BifrostConfigError("nope"))
+    )
+    resp = await jp_fetch("bifrost", "project")
+    assert resp.code == 200
+    assert json.loads(resp.body) == {"configured": False}
+
+
+async def test_start_without_a_settled_project_explains_itself(jp_fetch, patch_client):
+    """The bug this route exists for: a start with no project to use answers
+    409 with the reason and the candidates — not Bifrost's 403 about a project
+    that was never the caller's."""
+    patch_client(
+        FakeClient(
+            identity={
+                "subject": "alice",
+                "groups": [],
+                "roles": ["developer"],
+                "projects": [
+                    {"name": "team-a", "roles": ["operator"]},
+                    {"name": "team-b", "roles": ["operator"]},
+                ],
+            }
+        )
+    )
+    with pytest.raises(HTTPClientError) as exc:
+        await jp_fetch("bifrost", "clusters", method="POST", body='{"profile": "small"}')
+    assert exc.value.code == 409
+    body = json.loads(exc.value.response.body)
+    assert body["projects"] == ["team-a", "team-b"]
+    assert "choose" in body["message"]
+
+
+async def test_start_uses_the_project_the_panel_picked(jp_fetch, patch_client):
+    client = FakeClient(
+        view=SimpleNamespace(observed_state="pending", desired="running"),
+        identity={
+            "subject": "alice",
+            "groups": [],
+            "roles": ["developer"],
+            "projects": [
+                {"name": "team-a", "roles": ["operator"]},
+                {"name": "team-b", "roles": ["operator"]},
+            ],
+        },
+    )
+    patch_client(client)
+    resp = await jp_fetch(
+        "bifrost", "clusters", method="POST", body='{"profile": "small", "project": "team-b"}'
+    )
+    assert resp.code == 200
+    assert client.created.spec.project == "team-b"
+
+
+async def test_start_refuses_a_project_the_caller_may_not_use(jp_fetch, patch_client):
+    patch_client(FakeClient(view=SimpleNamespace(observed_state="pending", desired="running")))
+    with pytest.raises(HTTPClientError) as exc:
+        await jp_fetch(
+            "bifrost",
+            "clusters",
+            method="POST",
+            body='{"profile": "small", "project": "someone-elses"}',
+        )
+    assert exc.value.code == 409
+    assert "someone-elses" in json.loads(exc.value.response.body)["message"]
+
+
+async def test_start_rejects_a_non_string_project(jp_fetch, patch_client):
+    patch_client(FakeClient())
+    with pytest.raises(HTTPClientError) as exc:
+        await jp_fetch(
+            "bifrost", "clusters", method="POST", body='{"profile": "small", "project": 7}'
+        )
+    assert exc.value.code == 400
