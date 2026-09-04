@@ -44,15 +44,6 @@ pytestmark = [
 ]
 
 
-async def test_live_post_clusters(jp_fetch):
-    resp = await jp_fetch("bifrost", "clusters", method="POST", body='{"profile": "small"}')
-    assert resp.code == 200
-    payload = json.loads(resp.body)
-    assert payload["id"]
-    assert payload["status"]  # 'running' desired; observed may lag without a controller
-    assert os.environ["BIFROST_TOKEN"] not in resp.body.decode()
-
-
 async def _create(jp_fetch) -> str:
     resp = await jp_fetch("bifrost", "clusters", method="POST", body='{"profile": "small"}')
     assert resp.code == 200
@@ -175,3 +166,19 @@ async def test_live_a_token_is_never_echoed(jp_fetch):
     for path in (("bifrost", "profiles"), ("bifrost", "clusters")):
         resp = await jp_fetch(*path)
         assert token not in resp.body.decode()
+
+
+async def test_live_post_clusters(jp_fetch):
+    """A profile name is enough to start a cluster, and the answer names it.
+
+    Stops the cluster afterwards: this suite runs against a real deployment, so
+    a test that leaves its cluster behind leaves a head pod running on somebody
+    else's cluster — sixteen of them, in the run that found this.
+    """
+    resp = await jp_fetch("bifrost", "clusters", method="POST", body='{"profile": "small"}')
+    assert resp.code == 200
+    payload = json.loads(resp.body)
+    assert payload["id"]
+    assert payload["status"]  # pending until the reconciler observes it
+    assert os.environ["BIFROST_TOKEN"] not in resp.body.decode()
+    await _delete(jp_fetch, payload["id"])
