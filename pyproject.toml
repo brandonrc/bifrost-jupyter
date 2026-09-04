@@ -125,3 +125,9 @@ python_version = "3.10"
 ignore_missing_imports = true
 files = ["bifrost_jupyter"]
 exclude = "bifrost_jupyter/labextension"
+
+[tool.pytest.ini_options]
+# `live` marks the tests that drive a real Bifrost rather than a fake. They are
+# skipped unless BIFROST_LIVE=1, and the autouse credential fixture hands them
+# the ambient environment instead of a scrubbed one (see conftest.py).
+markers = ["live: drives a real Bifrost (needs BIFROST_LIVE=1 and BIFROST_API_URL/BIFROST_TOKEN)"]
