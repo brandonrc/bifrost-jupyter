@@ -292,9 +292,11 @@ describe('BifrostPanel', () => {
     const selects = panel.node.querySelectorAll('select');
     const projectSelect = selects[1] as HTMLSelectElement;
     expect(projectSelect.hidden).toBe(false);
-    expect(
-      Array.from(projectSelect.options).map(o => o.value)
-    ).toEqual(['', 'team-a', 'team-b']);
+    expect(Array.from(projectSelect.options).map(o => o.value)).toEqual([
+      '',
+      'team-a',
+      'team-b'
+    ]);
 
     // Start stays disabled until the project is picked: a start without one
     // answers 409, which the user cannot act on from here.
