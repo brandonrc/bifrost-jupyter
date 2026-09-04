@@ -47,6 +47,23 @@ export interface IProfilesResponse {
   profiles: IProfileView[];
 }
 
+/**
+ * Response of ``GET /bifrost/project`` — where a start would land.
+ *
+ * ``project`` is the one settled for this user, or ``null`` when it is not
+ * settled: then ``projects`` lists what they may choose between (possibly
+ * empty) and ``note`` says what has to happen. The panel shows this before the
+ * Start click, because a project nobody chose used to surface as a 403 about a
+ * permission the user did have (bifrost-jupyter#3).
+ */
+export interface IProjectResponse {
+  configured: boolean;
+  project?: string | null;
+  projects?: string[];
+  note?: string | null;
+  source?: string;
+}
+
 /** Response of ``POST /bifrost/clusters`` (design §3.2). */
 export interface ICreateClusterResponse {
   id: string;
@@ -187,12 +204,31 @@ export async function listProfiles(
  */
 export async function createCluster(
   serverSettings: ServerConnection.ISettings,
-  profile: string
+  profile: string,
+  project?: string
 ): Promise<ICreateClusterResponse> {
+  // `project` is only sent when the user was offered a choice: with one grant
+  // the server settles it, and sending a value there would let a stale panel
+  // start a cluster somewhere the user has since lost access to.
+  const body = project ? { profile, project } : { profile };
   return bifrostRequest<ICreateClusterResponse>(serverSettings, 'clusters', {
     method: 'POST',
-    body: JSON.stringify({ profile })
+    body: JSON.stringify(body)
   });
+}
+
+/**
+ * ``GET /bifrost/project`` — which project a start would land in.
+ *
+ * Its own route rather than part of the profile list: profiles are deployment
+ * configuration and answer instantly, while this asks Bifrost who the caller
+ * is, so the panel paints its profiles first and fills the project in when the
+ * answer arrives.
+ */
+export async function getProject(
+  serverSettings: ServerConnection.ISettings
+): Promise<IProjectResponse> {
+  return bifrostRequest<IProjectResponse>(serverSettings, 'project');
 }
 
 /**

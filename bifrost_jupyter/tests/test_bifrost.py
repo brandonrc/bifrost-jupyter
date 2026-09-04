@@ -30,7 +30,7 @@ def test_create_cluster_passes_body_through():
     captured = {}
     client._clusters.create_cluster = lambda body, **kw: captured.setdefault("body", body)
 
-    body = build_create_cluster("small")
+    body = build_create_cluster("small", project="team-a")
     client.create_cluster(body)
     assert captured["body"] is body
 
@@ -277,7 +277,7 @@ def test_create_403_names_the_operator_role():
     client._clusters.create_cluster = raiser
 
     with pytest.raises(bifrost.BifrostAPIError) as exc_info:
-        client.create_cluster(build_create_cluster("small"))
+        client.create_cluster(build_create_cluster("small", project="team-a"))
     assert exc_info.value.status == 403
     assert "operator" in exc_info.value.message
     assert "SECRET" not in exc_info.value.message
@@ -356,7 +356,7 @@ def test_client_from_env_reuses_the_session_credential(monkeypatch):
 # life of the server, and enough of those starve the pool back into a freeze.
 
 _OPS = [
-    ("create_cluster", lambda c: c.create_cluster(build_create_cluster("small"))),
+    ("create_cluster", lambda c: c.create_cluster(build_create_cluster("small", project="team-a"))),
     ("get_cluster", lambda c: c.get_cluster("cl-1")),
     ("list_clusters", lambda c: c.list_clusters()),
     ("delete_cluster", lambda c: c.delete_cluster("cl-1")),

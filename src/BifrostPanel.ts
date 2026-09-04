@@ -18,6 +18,7 @@ import { Widget } from '@lumino/widgets';
 
 import {
   createCluster,
+  getProject,
   dashboardUrl,
   EnvVars,
   getAddress,
@@ -62,6 +63,12 @@ export class BifrostPanel extends Widget {
   private _openDashboard: OpenDashboard | undefined;
   private _trans: TranslationBundle;
   private _select: HTMLSelectElement;
+  private _projectLabel: HTMLSpanElement;
+  private _projectSelect: HTMLSelectElement;
+  //: The project a start will use: settled by the server, or picked here when
+  //: the user holds grants in several. Empty means not settled yet.
+  private _project = '';
+  private _projectChoices: string[] = [];
   private _startButton: HTMLButtonElement;
   private _statusList: HTMLUListElement;
   private _messageBar: HTMLDivElement;
@@ -132,7 +139,24 @@ export class BifrostPanel extends Widget {
       void this._onStart();
     });
 
+    // Which project a start lands in. A label when the answer is settled, a
+    // picker when the user holds grants in several, and hidden until the
+    // answer arrives — the profile list must not wait on it (see api.getProject).
+    this._projectLabel = document.createElement('span');
+    this._projectLabel.className = 'jp-BifrostPanel-project';
+    this._projectLabel.hidden = true;
+
+    this._projectSelect = document.createElement('select');
+    this._projectSelect.className = 'jp-BifrostPanel-select';
+    this._projectSelect.setAttribute('aria-label', trans.__('Project'));
+    this._projectSelect.hidden = true;
+    this._projectSelect.addEventListener('change', () =>
+      this._syncStartEnabled()
+    );
+
     controls.appendChild(this._select);
+    controls.appendChild(this._projectLabel);
+    controls.appendChild(this._projectSelect);
     controls.appendChild(this._startButton);
 
     this._messageBar = document.createElement('div');
@@ -279,6 +303,7 @@ export class BifrostPanel extends Widget {
   protected onAfterAttach(msg: Message): void {
     super.onAfterAttach(msg);
     void this._loadProfiles();
+    void this._loadProject();
     void this._refreshStatus();
     this._pollTimer = window.setInterval(() => {
       void this._refreshStatus();
@@ -302,6 +327,56 @@ export class BifrostPanel extends Widget {
       window.clearInterval(this._pollTimer);
       this._pollTimer = null;
     }
+  }
+
+  /**
+   * Ask where a start would land, and show it.
+   *
+   * Failure is quiet on purpose: the project is also settled server-side, so a
+   * panel that could not read this still starts clusters wherever the server
+   * says. What it must not do is claim a project it does not know.
+   */
+  private async _loadProject(): Promise<void> {
+    let response;
+    try {
+      response = await getProject(this._serverSettings);
+    } catch {
+      return;
+    }
+    // An older server has no such route, and a mocked one may answer nothing:
+    // either way there is no project to claim, so say nothing about it.
+    if (!response || response.configured === false) {
+      return;
+    }
+    this._projectChoices = response.projects ?? [];
+    this._project = response.project ?? '';
+
+    if (this._project) {
+      this._projectLabel.textContent = this._trans.__('in %1', this._project);
+      this._projectLabel.hidden = false;
+      this._projectSelect.hidden = true;
+    } else if (this._projectChoices.length > 0) {
+      this._projectSelect.replaceChildren();
+      const placeholder = document.createElement('option');
+      placeholder.value = '';
+      placeholder.textContent = this._trans.__('Choose a project…');
+      placeholder.disabled = true;
+      placeholder.selected = true;
+      this._projectSelect.appendChild(placeholder);
+      for (const name of this._projectChoices) {
+        const option = document.createElement('option');
+        option.value = name;
+        option.textContent = name;
+        this._projectSelect.appendChild(option);
+      }
+      this._projectSelect.hidden = false;
+      this._projectLabel.hidden = true;
+    } else if (response.note) {
+      // No project and no choice: say why here rather than letting the Start
+      // click answer it.
+      this._showMessage(response.note, true);
+    }
+    this._syncStartEnabled();
   }
 
   private async _loadProfiles(): Promise<void> {
@@ -355,8 +430,14 @@ export class BifrostPanel extends Widget {
    * start against).
    */
   private _syncStartEnabled(): void {
+    // A project the user must choose is as much a precondition as a profile:
+    // starting without one gets a 409 the user cannot act on from here.
+    const needsAProject =
+      this._project === '' && this._projectChoices.length > 0;
     this._startButton.disabled =
-      this._unconfigured || this._select.value === '';
+      this._unconfigured ||
+      this._select.value === '' ||
+      (needsAProject && this._projectSelect.value === '');
   }
 
   private async _onStart(): Promise<void> {
@@ -367,7 +448,11 @@ export class BifrostPanel extends Widget {
     this._startButton.disabled = true;
     this._showMessage(this._trans.__('Starting %1…', profile), false);
     try {
-      const result = await createCluster(this._serverSettings, profile);
+      const result = await createCluster(
+        this._serverSettings,
+        profile,
+        this._projectSelect.hidden ? undefined : this._projectSelect.value
+      );
       this._showMessage(
         this._trans.__('Started %1 (%2).', result.id, result.status),
         false
