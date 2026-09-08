@@ -25,6 +25,7 @@ from bifrost_jupyter import _credentials, _jobs, bifrost, handlers
 from bifrost_jupyter.bifrost import BifrostAPIError, BifrostConfigError
 from bifrost_jupyter.tests import ROUTE_SSRF_IDS
 from bifrost_jupyter.tests.test_credentials import make_jwt
+from bifrost_jupyter.tests.test_profiles import CATALOG
 
 TOKEN = "bfr_supersecrettoken"
 
@@ -50,8 +51,14 @@ class FakeClient:
         list_error=None,
         action_error=None,
         identity=DEFAULT_IDENTITY,
+        profiles=None,
+        profiles_error=None,
     ):
         self._view = view
+        # The administrator's catalog as Bifrost would narrow it for this
+        # caller; the default carries the two shapes the profile tests use.
+        self._profiles = CATALOG if profiles is None else profiles
+        self._profiles_error = profiles_error
         self._create_error = create_error
         self._clusters = clusters or []
         self._list_error = list_error
@@ -71,6 +78,11 @@ class FakeClient:
 
     def identity(self):
         return self._identity
+
+    def list_profiles(self):
+        if self._profiles_error:
+            raise self._profiles_error
+        return self._profiles
 
     def list_clusters(self):
         if self._list_error:
@@ -191,8 +203,9 @@ async def test_post_clusters_rejects_raw_spec_passthrough(jp_fetch, patch_client
     resp = await jp_fetch("bifrost", "clusters", method="POST", body=body)
     assert resp.code == 200
     created = client.created
-    assert created.spec.image == "rayproject/ray:2.9.0"  # from the profile, not the body
-    assert created.spec.head_cpu == "1"  # from the profile, not the body
+    assert created.spec.profile == "small"  # the name is the whole request
+    assert created.spec.image == ""  # Bifrost fills it from the catalog, not the body
+    assert created.spec.head_cpu == ""
     assert created.spec.owner is None  # never accepted from the client
 
 
@@ -214,6 +227,22 @@ async def test_get_clusters_returns_list_with_id_and_state(jp_fetch, patch_clien
     assert payload["configured"] is True
     # The token must never be echoed back to the browser.
     assert TOKEN not in resp.body.decode()
+
+
+async def test_get_clusters_hides_tombstones(jp_fetch, patch_client):
+    # A stopped cluster keeps its record until Bifrost purges it, with no
+    # observed state left. Rendered by the rule above it reads "pending" — and
+    # sixty-six of those were what the panel showed a new user on a deployment
+    # a live suite had run against. They are not actionable and not coming
+    # back, so the list carries only what can be used.
+    views = [
+        SimpleNamespace(id="jl-small-live", observed_state="running", desired="running"),
+        SimpleNamespace(id="jl-small-dead", observed_state=None, desired="terminated"),
+        SimpleNamespace(id="jl-small-gone", observed_state="terminated", desired="terminated"),
+    ]
+    patch_client(FakeClient(clusters=views))
+    resp = await jp_fetch("bifrost", "clusters", method="GET")
+    assert json.loads(resp.body)["clusters"] == [{"id": "jl-small-live", "state": "running"}]
 
 
 async def test_get_clusters_empty(jp_fetch, patch_client):
@@ -245,14 +274,15 @@ async def test_get_clusters_unconfigured_returns_200_configured_false(jp_fetch, 
     assert payload == {"clusters": [], "configured": False}
 
 
-async def test_get_profiles_returns_safe_view(jp_fetch):
+async def test_get_profiles_returns_the_callers_catalog_as_the_safe_view(jp_fetch, patch_client):
+    patch_client(FakeClient())
     resp = await jp_fetch("bifrost", "profiles")
     assert resp.code == 200
     body = resp.body.decode()
     payload = json.loads(body)
 
-    names = {p["name"] for p in payload["profiles"]}
-    assert {"small", "medium", "gpu"} <= names
+    assert payload["configured"] is True
+    assert {p["name"] for p in payload["profiles"]} == {"small", "gpu"}
     # The safe view carries the coarse shape but never a raw manifest surface.
     for p in payload["profiles"]:
         assert "description" in p and "head_cpu" in p
@@ -261,17 +291,44 @@ async def test_get_profiles_returns_safe_view(jp_fetch):
     assert "rayproject/ray" not in body  # image string never leaks
 
 
+async def test_get_profiles_is_whatever_bifrost_offers_this_user(jp_fetch, patch_client):
+    # No built-in names: a deployment whose catalog is empty for this caller
+    # offers nothing, rather than three shapes nobody approved.
+    patch_client(FakeClient(profiles=[]))
+    resp = await jp_fetch("bifrost", "profiles")
+    assert resp.code == 200
+    assert json.loads(resp.body) == {"profiles": [], "configured": True}
+
+
 async def test_get_profiles_unconfigured_returns_200(jp_fetch, monkeypatch):
-    # Profiles are the static, config-driven allowlist and never touch Bifrost,
-    # so the load-time poll returns 200 with the list even when Bifrost is
-    # unconfigured — and raises nothing (would-be client construction blows up).
+    # The panel polls this on load; a bare install answers with an explicit
+    # "unconfigured" shape rather than a 5xx in the server log.
     def boom():
         raise BifrostConfigError("no token")
 
     monkeypatch.setattr(handlers, "client_from_env", boom)
     resp = await jp_fetch("bifrost", "profiles")
     assert resp.code == 200
-    assert len(json.loads(resp.body)["profiles"]) >= 1
+    assert json.loads(resp.body) == {"profiles": [], "configured": False}
+
+
+async def test_get_profiles_relays_a_bifrost_error(jp_fetch, patch_client):
+    patch_client(FakeClient(profiles_error=BifrostAPIError(503, "bifrost is down")))
+    with pytest.raises(HTTPClientError) as exc:
+        await jp_fetch("bifrost", "profiles")
+    assert exc.value.code == 503
+    assert json.loads(exc.value.response.body)["error"] == "bifrost is down"
+
+
+async def test_post_clusters_reads_the_catalog_as_the_user(jp_fetch, patch_client):
+    # A name Bifrost would not offer this caller is refused here, with the
+    # names it would — not sent on to become a 400 about a profile the user
+    # never saw.
+    patch_client(FakeClient(profiles=[CATALOG[1]]))  # gpu only
+    with pytest.raises(HTTPClientError) as exc:
+        await jp_fetch("bifrost", "clusters", method="POST", body='{"profile": "small"}')
+    assert exc.value.code == 400
+    assert "['gpu']" in json.loads(exc.value.response.body)["error"]
 
 
 async def test_get_address_returns_in_cluster_snippet(jp_fetch):
@@ -834,6 +891,10 @@ class SlowClient:
         # a slow identity on every route would test the pool, not the route.
         return DEFAULT_IDENTITY
 
+    def list_profiles(self):
+        # Likewise instant: a start reads the catalog before it creates.
+        return CATALOG
+
     def list_clusters(self):
         self._entered.set()
         time.sleep(SLOW_CALL_SECONDS)
@@ -877,7 +938,10 @@ async def _assert_loop_stays_responsive(jp_fetch, monkeypatch, slow_request):
     async def fast():
         while not entered.is_set():
             await asyncio.sleep(0.01)
-        await jp_fetch("bifrost", "profiles")
+        # A route that makes no Bifrost call: the address is derived from the
+        # id and the configured namespace alone. (The profile list used to be
+        # the trivial request; it is a Bifrost call now.)
+        await jp_fetch("bifrost", "clusters", "cl-1", "address")
         order.append("fast")
 
     await asyncio.gather(slow(), fast())
@@ -940,7 +1004,10 @@ async def test_slow_credential_resolution_does_not_block_the_loop(jp_fetch, monk
     async def fast():
         while not entered.is_set():
             await asyncio.sleep(0.01)
-        await jp_fetch("bifrost", "profiles")
+        # A route that makes no Bifrost call: the address is derived from the
+        # id and the configured namespace alone. (The profile list used to be
+        # the trivial request; it is a Bifrost call now.)
+        await jp_fetch("bifrost", "clusters", "cl-1", "address")
         order.append("fast")
 
     await asyncio.gather(slow(), fast())

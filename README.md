@@ -100,9 +100,9 @@ group in Bifrost's auth config:
 
 `roles.operator` grants it globally to members of the listed groups;
 `project_roles.operator` is the self-service form — a member of group `team-a`
-gets operator scoped to `project:team-a`. Note the extension's profiles stamp a
-fixed project (`BIFROST_PROJECT`, default `jupyter`), so with `project_roles`
-that project name must match a group the user is in.
+gets operator scoped to `project:team-a`. The panel starts clusters in the
+project the caller's grant names (or `BIFROST_PROJECT` when an operator pins
+one), so with `project_roles` that is the group the user is in.
 
 Without this mapping the extension is unusable, so the panel says so instead of
 showing a bare "forbidden": a 403 on a lifecycle action reports that cluster
@@ -202,19 +202,28 @@ while the Bifrost control plane keeps answering. If Ray Client hangs _and_ job
 submission fails while start/stop/list are fine, suspect the owner label, not the
 address.
 
-## Approved profiles, and why every profile must set `ttl_seconds`
+## Approved profiles come from Bifrost
 
-Users never send a raw manifest. `GET /bifrost/profiles` returns an
-admin-approved allowlist (built-in `small`/`medium`/`gpu`, replaceable wholesale
-via the `BifrostConfig.profiles` traitlet in `jupyter_server_config.py`), the
-panel shows those names, and the server maps the chosen **name** to a
-`ClusterSpec`. Nothing in the request body reaches the spec.
+Users never send a raw manifest. `GET /bifrost/profiles` is Bifrost's own
+`GET /api/v1/profiles`, seen through this user's token — the administrator's
+catalog (`PUT /api/v1/settings/policy`, `profiles`), already narrowed to the
+profiles this user's projects may use. The panel shows those names, and a start
+sends the chosen **name** in `ClusterSpec.profile` with every shape field empty;
+Bifrost fills the shape from its catalog and refuses a body that tries to say
+otherwise. Nothing in the request body reaches the spec.
 
-**Every profile must set `ttl_seconds`, and the built-ins set 3600.** This is a
-correctness requirement, not a default worth tuning casually. Bifrost reaps idle
+The extension used to carry a catalog of its own, compiled in, on
+`rayproject/ray:2.9.0`. It kept working for as long as nobody connected to the
+cluster it started: a Ray 2.56 / Python 3.12 notebook that did was refused with
+a version mismatch by the cluster the panel had offered it. One catalog now, and
+it is the one an administrator curates — which also means the image, Ray
+version, TTL and idle timeout of what a notebook can start are set in one place,
+next to the quotas, rather than in a traitlet on every notebook image.
+
+**Set `ttl_seconds` on every profile a notebook may use.** Bifrost reaps idle
 clusters using `idle_timeout_secs`, which counts _gateway job activity_ — and an
 interactive cluster driven from a notebook submits no gateway jobs. It looks
-permanently idle-free to the reaper while doing nothing. `ttl_seconds` is an
+permanently busy-free to the reaper while doing nothing. `ttl_seconds` is an
 absolute cap that does not depend on activity, so it is the only thing standing
 between a forgotten panel tab and a cluster that runs until someone notices the
 bill. A profile without it is a capacity leak.

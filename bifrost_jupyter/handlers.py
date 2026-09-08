@@ -198,25 +198,40 @@ class _BifrostHandler(_ClusterIdMixin, APIHandler):
             self._fail(exc.status, exc.message)
             return None
 
-    def _allowlist(self):
-        # Resolved at extension load; defaults to the built-in set if unset.
-        return self.settings.get("bifrost_profiles") or _profiles.DEFAULT_PROFILES
-
 
 class ProfilesHandler(_BifrostHandler):
-    """``GET /bifrost/profiles`` — the safe allowlist view (no manifest surface).
+    """``GET /bifrost/profiles`` — the caller's catalog, as the safe view.
 
-    Deliberately local and instant: the allowlist is deployment configuration,
-    so this route makes no Bifrost call and does no credential work. That is a
-    property worth keeping — the panel paints its profile list on load, and a
-    slow IdP must not delay it. *Where* a start would land is a network fact
-    and lives on its own route (:class:`ProjectHandler`).
+    Asks Bifrost, as the user: ``GET /api/v1/profiles`` already narrows the
+    administrator's catalog to the profiles this caller's projects may use, so
+    what the panel offers is exactly what a start would be allowed to name.
+
+    This route used to be local and instant — a catalog compiled into the
+    extension — and that is how the panel came to offer a Ray 2.9 / Python 3.8
+    cluster to a Ray 2.56 / Python 3.12 notebook. An unconfigured extension
+    still answers 200 with an empty list rather than erroring on a bare install,
+    matching the cluster list's load-time poll.
     """
 
     @tornado.web.authenticated
-    def get(self) -> None:
-        views = _profiles.list_profiles(self._allowlist())
-        self.finish(json.dumps({"profiles": [v.to_dict() for v in views]}))
+    async def get(self) -> None:
+        try:
+            client = await self._client()
+        except BifrostConfigError:
+            self.finish(json.dumps({"profiles": [], "configured": False}))
+            return
+        except BifrostAPIError as exc:
+            self._fail(exc.status, exc.message)
+            return
+
+        try:
+            catalog = await self._blocking(client.list_profiles)
+        except BifrostAPIError as exc:
+            self._fail(exc.status, exc.message)
+            return
+
+        views = _profiles.list_profiles(catalog)
+        self.finish(json.dumps({"profiles": [v.to_dict() for v in views], "configured": True}))
 
 
 class ProjectHandler(_BifrostHandler):
@@ -321,7 +336,13 @@ class ClustersHandler(_BifrostHandler):
             self._fail(exc.status, exc.message)
             return
 
-        clusters = [{"id": v.id, "state": _observed_state(v)} for v in views]
+        # A stopped cluster keeps its record until Bifrost purges it, with no
+        # observed state — which the rule below would render as "pending".
+        # Sixty-six of those, on a deployment a live suite had run against,
+        # were what the panel showed a new user first. They are not theirs to
+        # act on and not coming back; the list is what can be used.
+        live = [v for v in views if getattr(v, "desired", None) != "terminated"]
+        clusters = [{"id": v.id, "state": _observed_state(v)} for v in live]
         self.finish(json.dumps({"clusters": clusters, "configured": True}))
 
     @tornado.web.authenticated
@@ -375,10 +396,16 @@ class ClustersHandler(_BifrostHandler):
             )
             return
 
+        # The catalog is read now, as this user, rather than remembered from
+        # load: an administrator's edit must reach the next start, and a name
+        # this caller's projects may not use must not be offered a guess.
         try:
-            body = _profiles.profile_to_spec(
-                name, self._allowlist(), project=resolution.project
-            )
+            catalog = await self._blocking(client.list_profiles)
+        except BifrostAPIError as exc:
+            self._fail(exc.status, exc.message)
+            return
+        try:
+            body = _profiles.profile_to_spec(name, catalog, project=resolution.project)
         except _profiles.UnknownProfileError as exc:
             self._fail(400, str(exc))
             return
@@ -661,11 +688,10 @@ class ClusterDashboardHandler(_ClusterDashboardBase):
         self.finish()
 
 
-def setup_handlers(web_app, namespace: str | None = None, profiles=None) -> None:
+def setup_handlers(web_app, namespace: str | None = None) -> None:
     host_pattern = ".*$"
     base_url = web_app.settings["base_url"]
     web_app.settings["bifrost_cluster_namespace"] = namespace or default_namespace()
-    web_app.settings["bifrost_profiles"] = profiles or _profiles.DEFAULT_PROFILES
 
     profiles_url = url_path_join(base_url, "bifrost", "profiles")
     project_url = url_path_join(base_url, "bifrost", "project")
