@@ -29,7 +29,7 @@ dependencies = [
     # here and in the README. Requires `allow-direct-references` (see
     # [tool.hatch.metadata] below). If bifrost-api ever goes private, this URL
     # install breaks and needs an authenticated asset download instead.
-    "bifrost_client @ https://github.com/brandonrc/bifrost-api/releases/download/python-v0.1.4/bifrost_client-0.1.4-py3-none-any.whl",
+    "bifrost_client @ https://github.com/brandonrc/bifrost-api/releases/download/python-v0.1.10/bifrost_client-0.1.10-py3-none-any.whl",
 ]
 dynamic = ["version", "description", "authors", "urls", "keywords"]
 

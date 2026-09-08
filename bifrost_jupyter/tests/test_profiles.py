@@ -1,268 +1,137 @@
-"""Profile → CreateCluster mapping (design §5, §7)."""
-
-import json
+"""Profile name → CreateCluster body, against the catalog Bifrost hands back."""
 
 import pytest
+from bifrost_client.models.profile_spec import ProfileSpec
+from bifrost_client.models.worker_group import WorkerGroup
 
 from bifrost_jupyter import _profiles
 
 
-def test_small_profile_maps_to_create_cluster():
-    body = _profiles.build_create_cluster(_profiles.SMALL, project="team-a")
+def spec(name: str, *, gpu: str | None = None, max_replicas: int = 2, **overrides) -> ProfileSpec:
+    base = ProfileSpec(
+        name=name,
+        description=f"the {name} shape",
+        image="rayproject/ray:2.56.0",
+        ray_version="2.56.0",
+        head_cpu="1",
+        head_memory="2Gi",
+        ttl_seconds=3600,
+        worker_groups=[
+            WorkerGroup(
+                name="w",
+                cpu="1",
+                memory="2Gi",
+                gpu=gpu,
+                replicas=1,
+                min_replicas=0,
+                max_replicas=max_replicas,
+            )
+        ],
+    )
+    return base.model_copy(update=overrides) if overrides else base
+
+
+SMALL_SPEC = spec("small")
+CATALOG = [SMALL_SPEC, spec("gpu", gpu="1", max_replicas=2)]
+
+
+def test_a_name_from_the_catalog_maps_to_a_create_cluster():
+    body = _profiles.profile_to_spec("small", CATALOG, project="team-a")
 
     assert body.id
     assert body.id == body.spec.name  # id is the RayCluster name / routing key
-    assert body.spec.image
-    assert body.spec.ray_version
-    assert body.spec.head_cpu and body.spec.head_memory
-    assert len(body.spec.worker_groups) == 1
-    wg = body.spec.worker_groups[0]
-    assert wg.replicas >= wg.min_replicas
-    assert wg.max_replicas >= wg.replicas
+    assert body.spec.project == "team-a"
+    assert body.spec.profile == "small"
 
 
-def test_ttl_seconds_is_set():
-    # Interactive clusters submit no gateway jobs, so idle_timeout can't reap
-    # them — ttl_seconds is the only reaper that can. It must be set.
-    body = _profiles.build_create_cluster(_profiles.SMALL, project="team-a")
-    assert body.spec.ttl_seconds is not None
-    assert body.spec.ttl_seconds > 0
+def test_the_body_carries_the_name_and_no_shape():
+    # "Zero-valued fields are filled from the profile; conflicting non-empty
+    # fields are refused" — so the client sends nothing that could conflict.
+    # The shape, the image, the Ray version, the TTL are Bifrost's to decide.
+    body = _profiles.profile_to_spec("small", CATALOG, project="team-a")
+    assert body.spec.image == ""
+    assert body.spec.ray_version == ""
+    assert body.spec.head_cpu == "" and body.spec.head_memory == ""
+    assert body.spec.worker_groups == []
+    assert body.spec.ttl_seconds is None
+    assert body.spec.idle_timeout_secs is None
 
 
 def test_owner_is_not_set():
-    # owner is stamped control-plane-side from the token, never from the body.
-    body = _profiles.build_create_cluster(_profiles.SMALL, project="team-a")
+    # Bifrost stamps the owner from the request identity; never from the body.
+    body = _profiles.profile_to_spec("small", CATALOG, project="team-a")
     assert body.spec.owner is None
-    # And it must not appear in the serialized wire body either.
-    assert "owner" not in body.spec.to_dict()
 
 
 def test_ids_are_unique_per_call():
-    a = _profiles.build_create_cluster(_profiles.SMALL, project="team-a")
-    b = _profiles.build_create_cluster(_profiles.SMALL, project="team-a")
+    a = _profiles.profile_to_spec("small", CATALOG, project="team-a")
+    b = _profiles.profile_to_spec("small", CATALOG, project="team-a")
     assert a.id != b.id
 
 
 def test_explicit_cluster_id_is_honored():
-    body = _profiles.build_create_cluster(_profiles.SMALL, cluster_id="fixed-id", project="team-a")
-    assert body.id == "fixed-id"
-    assert body.spec.name == "fixed-id"
-
-
-def test_the_project_is_the_one_passed_in(monkeypatch):
-    """The builder uses the project it is given and consults nothing else.
-
-    It used to read BIFROST_PROJECT here and fall back to a hardcoded
-    "jupyter", which put the decision — and its default — out of reach of the
-    handler that has to explain it. Resolution now lives in `_projects`, which
-    is where the environment is read; this layer only builds a body.
-    """
-    monkeypatch.setenv("BIFROST_PROJECT", "team-x")
-    body = _profiles.build_create_cluster(_profiles.SMALL, project="team-a")
-    assert body.spec.project == "team-a"
+    body = _profiles.profile_to_spec("small", CATALOG, cluster_id="my-cluster", project="team-a")
+    assert body.id == "my-cluster"
+    assert body.spec.name == "my-cluster"
 
 
 def test_a_body_without_a_project_is_refused():
-    """No default: a missing project is a programming error, not a guess."""
-    with pytest.raises(ValueError, match="needs a project"):
-        _profiles.build_create_cluster(_profiles.SMALL)
+    with pytest.raises(ValueError, match="project"):
+        _profiles.profile_to_spec("small", CATALOG)
 
 
-def test_unknown_profile_raises():
-    with pytest.raises(KeyError):
-        _profiles.build_create_cluster("enormous", project="team-a")
-
-
-def test_unknown_profile_raises_unknown_profile_error():
-    # A clear, typed error — not a default fallback.
+def test_a_name_the_catalog_does_not_carry_is_refused():
+    # Never a fallback: the catalog is what this caller may start, and a name
+    # outside it is answered with what is inside it.
     with pytest.raises(_profiles.UnknownProfileError) as exc:
-        _profiles.profile_to_spec("enormous", project="team-a")
-    assert "unknown profile" in str(exc.value)
-    assert "enormous" in str(exc.value)
+        _profiles.profile_to_spec("enormous", CATALOG, project="team-a")
+    assert exc.value.name == "enormous"
+    assert exc.value.available == ["gpu", "small"]
+    assert "enormous" in str(exc.value) and "small" in str(exc.value)
+    assert isinstance(exc.value, KeyError)
 
 
-# ---- Invariants that must hold for EVERY default profile --------------------
+def test_an_empty_catalog_refuses_everything():
+    with pytest.raises(_profiles.UnknownProfileError):
+        _profiles.profile_to_spec("small", [], project="team-a")
 
 
-@pytest.mark.parametrize("name", sorted(_profiles.DEFAULT_PROFILES))
-def test_every_profile_sets_ttl_and_omits_owner(name):
-    body = _profiles.profile_to_spec(name, project="team-a")
-    assert body.spec.ttl_seconds is not None and body.spec.ttl_seconds > 0
-    assert body.spec.owner is None
-    assert "owner" not in body.spec.to_dict()
+def test_list_profiles_returns_the_safe_view():
+    views = _profiles.list_profiles(CATALOG)
+    by_name = {v.name: v.to_dict() for v in views}
+    assert set(by_name) == {"small", "gpu"}
+    small = by_name["small"]
+    assert small["description"] == "the small shape"
+    assert small["head_cpu"] == "1" and small["head_memory"] == "2Gi"
+    assert small["workers"] == [
+        {"cpu": "1", "memory": "2Gi", "gpu": None, "min_replicas": 0, "max_replicas": 2}
+    ]
+    # Never the manifest surface.
+    for view in by_name.values():
+        assert "image" not in view and "ray_version" not in view
 
 
-@pytest.mark.parametrize("name", sorted(_profiles.DEFAULT_PROFILES))
-def test_every_profile_maps_to_valid_body(name):
-    body = _profiles.profile_to_spec(name, project="team-a")
-    assert body.id == body.spec.name
-    assert body.spec.image and body.spec.ray_version
-    assert body.spec.head_cpu and body.spec.head_memory
-    assert body.spec.worker_groups
-    for wg in body.spec.worker_groups:
-        assert wg.min_replicas <= wg.replicas <= wg.max_replicas
+def test_gpu_profile_view_reports_gpu_count_at_max_scale():
+    views = {v.name: v for v in _profiles.list_profiles(CATALOG)}
+    assert views["small"].gpu == 0
+    assert views["gpu"].gpu == 2  # 1 GPU × max 2 replicas
 
 
-# ---- Safe listing view (no raw manifest surface) ----------------------------
-
-
-def test_list_profiles_returns_safe_view():
-    views = _profiles.list_profiles()
-    names = {v.name for v in views}
-    assert {"small", "medium", "gpu"} <= names
-    blob = json.dumps([v.to_dict() for v in views])
-    # The view exposes the coarse shape...
-    assert "head_cpu" in blob and "description" in blob
-    # ...but never the image / ray_version / raw manifest surface.
-    assert "image" not in blob
-    assert "ray_version" not in blob
-    assert "rayproject/ray" not in blob
-
-
-def test_gpu_profile_view_reports_gpu_count():
-    view = next(v for v in _profiles.list_profiles() if v.name == "gpu")
-    assert view.gpu >= 1
-    cpu_view = next(v for v in _profiles.list_profiles() if v.name == "small")
-    assert cpu_view.gpu == 0
-
-
-# ---- Generated-id length bound (KubeRay head-svc truncation guard) ----------
+def test_a_profile_without_a_description_renders_an_empty_one():
+    views = _profiles.list_profiles([spec("bare", description=None)])
+    assert views[0].to_dict()["description"] == ""
 
 
 def test_generated_ids_stay_within_length_bound():
-    for name in _profiles.DEFAULT_PROFILES:
-        assert len(_profiles.profile_to_spec(name, project="team-a").id) <= _profiles._MAX_ID_LEN
+    body = _profiles.profile_to_spec("small", CATALOG, project="team-a")
+    assert len(body.id) <= _profiles._MAX_ID_LEN
 
 
 def test_long_profile_name_id_is_bounded_and_dns_safe():
-    # A deployment could name a profile far longer than the defaults; the id
-    # must still be <= the bound so KubeRay does not truncate the head service.
-    long_name = "x" * 100
-    profiles = {
-        long_name: _profiles.Profile(
-            name=long_name,
-            description="huge name",
-            image="img:1",
-            ray_version="2.9.0",
-            head_cpu="1",
-            head_memory="2Gi",
-            ttl_seconds=3600,
-            worker_groups=(
-                _profiles.WorkerGroupShape(
-                    name="w", cpu="1", memory="2Gi", replicas=1, min_replicas=1, max_replicas=1
-                ),
-            ),
-        )
-    }
-    cid = _profiles.profile_to_spec(long_name, profiles, project="team-a").id
-    assert len(cid) <= _profiles._MAX_ID_LEN
-    assert cid.startswith("jl-")
-
-
-# ---- Config resolution ------------------------------------------------------
-
-
-def test_resolve_profiles_defaults_when_empty():
-    assert _profiles.resolve_profiles([]) == _profiles.DEFAULT_PROFILES
-    assert _profiles.resolve_profiles(None) == _profiles.DEFAULT_PROFILES
-
-
-def test_resolve_profiles_replaces_defaults():
-    resolved = _profiles.resolve_profiles(
-        [
-            {
-                "name": "only",
-                "description": "the only one",
-                "image": "img:1",
-                "ray_version": "2.9.0",
-                "head_cpu": "1",
-                "head_memory": "2Gi",
-                "ttl_seconds": 1800,
-                "worker_groups": [
-                    {
-                        "name": "w",
-                        "cpu": "1",
-                        "memory": "2Gi",
-                        "replicas": 1,
-                        "min_replicas": 1,
-                        "max_replicas": 1,
-                    }
-                ],
-            }
-        ]
-    )
-    assert set(resolved) == {"only"}
-    assert resolved["only"].ttl_seconds == 1800
-
-
-def test_resolve_profiles_defaults_ttl_and_ignores_owner():
-    # ttl_seconds is always set even if config omits it; an 'owner' key is ignored.
-    resolved = _profiles.resolve_profiles(
-        [
-            {
-                "name": "nottl",
-                "image": "img:1",
-                "ray_version": "2.9.0",
-                "head_cpu": "1",
-                "head_memory": "2Gi",
-                "owner": "attacker",
-                "worker_groups": [
-                    {
-                        "name": "w",
-                        "cpu": "1",
-                        "memory": "2Gi",
-                        "replicas": 1,
-                        "min_replicas": 1,
-                        "max_replicas": 1,
-                    }
-                ],
-            }
-        ]
-    )
-    assert resolved["nottl"].ttl_seconds == _profiles._DEFAULT_TTL_SECONDS
-    body = _profiles.profile_to_spec("nottl", resolved, project="team-a")
-    assert body.spec.ttl_seconds == _profiles._DEFAULT_TTL_SECONDS
-    assert body.spec.owner is None  # 'owner' in config never reaches the spec
-
-
-def test_resolve_profiles_rejects_missing_fields():
-    with pytest.raises(ValueError):
-        _profiles.resolve_profiles([{"name": "bad"}])
-
-
-def test_resolve_profiles_rejects_no_worker_groups():
-    with pytest.raises(ValueError):
-        _profiles.resolve_profiles(
-            [
-                {
-                    "name": "bad",
-                    "image": "img:1",
-                    "ray_version": "2.9.0",
-                    "head_cpu": "1",
-                    "head_memory": "2Gi",
-                    "worker_groups": [],
-                }
-            ]
-        )
-
-
-def test_resolve_profiles_rejects_duplicate_names():
-    entry = {
-        "name": "dup",
-        "image": "img:1",
-        "ray_version": "2.9.0",
-        "head_cpu": "1",
-        "head_memory": "2Gi",
-        "worker_groups": [
-            {
-                "name": "w",
-                "cpu": "1",
-                "memory": "2Gi",
-                "replicas": 1,
-                "min_replicas": 1,
-                "max_replicas": 1,
-            }
-        ],
-    }
-    with pytest.raises(ValueError):
-        _profiles.resolve_profiles([entry, dict(entry)])
+    name = "A Very Long Profile Name With Spaces And CAPS And !!! punctuation"
+    body = _profiles.profile_to_spec(name, [spec(name)], project="team-a")
+    assert len(body.id) <= _profiles._MAX_ID_LEN
+    assert body.id.startswith("jl-")
+    assert body.id == body.id.lower()
+    assert "--" not in body.id
+    assert not body.id.endswith("-")

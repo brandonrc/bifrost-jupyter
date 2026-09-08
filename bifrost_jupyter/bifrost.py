@@ -33,9 +33,10 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from bifrost_client import AccessApi, ApiException, ClustersApi, Configuration
+from bifrost_client import AccessApi, ApiException, ClustersApi, Configuration, ProfilesApi
 from bifrost_client.models.cluster_view import ClusterView
 from bifrost_client.models.create_cluster import CreateCluster
+from bifrost_client.models.profile_spec import ProfileSpec
 
 from . import _projects
 from ._apiclient import DEFAULT_TIMEOUT_SECONDS, bounded_api_client
@@ -162,6 +163,14 @@ class BifrostClient:
         # pydantic drops unknown fields, so a model round-trip would lose the
         # one thing the caller needs (see ._projects).
         self._access = AccessApi(client)
+        self._profiles = ProfilesApi(client)
+
+    def list_profiles(self) -> list[ProfileSpec]:
+        # Wraps Bifrost's ``GET /api/v1/profiles`` (Read): the administrator's
+        # catalog, already narrowed to the profiles the caller's projects may
+        # use. This is the only place the panel's profile list comes from.
+        specs: list[ProfileSpec] = self._call("list_profiles", _api=self._profiles)
+        return specs
 
     def identity(self) -> dict | None:
         """The caller's identity as Bifrost reports it, or ``None`` if unreadable.

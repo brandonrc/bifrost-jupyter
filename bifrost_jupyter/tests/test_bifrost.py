@@ -9,8 +9,9 @@ import pytest
 from bifrost_client import ApiException
 
 from bifrost_jupyter import _credentials, bifrost
-from bifrost_jupyter._profiles import build_create_cluster
+from bifrost_jupyter._profiles import profile_to_spec
 from bifrost_jupyter.tests.test_credentials import make_jwt
+from bifrost_jupyter.tests.test_profiles import SMALL_SPEC
 
 API_URL = "https://bifrost.example"
 TOKEN = "bfr_supersecrettoken"
@@ -30,9 +31,18 @@ def test_create_cluster_passes_body_through():
     captured = {}
     client._clusters.create_cluster = lambda body, **kw: captured.setdefault("body", body)
 
-    body = build_create_cluster("small", project="team-a")
+    body = profile_to_spec("small", [SMALL_SPEC], project="team-a")
     client.create_cluster(body)
     assert captured["body"] is body
+
+
+def test_list_profiles_passes_through():
+    # The panel's catalog is Bifrost's, read as the user; the server-side token
+    # is what narrows it to the profiles this caller's projects may use.
+    client = bifrost.BifrostClient(API_URL, TOKEN)
+    specs = [object()]
+    client._profiles.list_profiles = lambda **kw: specs
+    assert client.list_profiles() is specs
 
 
 def test_list_clusters_passes_through():
@@ -277,7 +287,7 @@ def test_create_403_names_the_operator_role():
     client._clusters.create_cluster = raiser
 
     with pytest.raises(bifrost.BifrostAPIError) as exc_info:
-        client.create_cluster(build_create_cluster("small", project="team-a"))
+        client.create_cluster(profile_to_spec("small", [SMALL_SPEC], project="team-a"))
     assert exc_info.value.status == 403
     assert "operator" in exc_info.value.message
     assert "SECRET" not in exc_info.value.message
@@ -356,7 +366,10 @@ def test_client_from_env_reuses_the_session_credential(monkeypatch):
 # life of the server, and enough of those starve the pool back into a freeze.
 
 _OPS = [
-    ("create_cluster", lambda c: c.create_cluster(build_create_cluster("small", project="team-a"))),
+    (
+        "create_cluster",
+        lambda c: c.create_cluster(profile_to_spec("small", [SMALL_SPEC], project="team-a")),
+    ),
     ("get_cluster", lambda c: c.get_cluster("cl-1")),
     ("list_clusters", lambda c: c.list_clusters()),
     ("delete_cluster", lambda c: c.delete_cluster("cl-1")),

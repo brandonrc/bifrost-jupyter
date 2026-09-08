@@ -5,6 +5,7 @@ from urllib.parse import urlsplit
 import pytest
 
 from bifrost_jupyter import _address, _profiles
+from bifrost_jupyter.tests.test_profiles import SMALL_SPEC
 
 
 def test_jobs_address_is_in_cluster_head_service():
@@ -97,7 +98,7 @@ def test_validate_cluster_id_accepts_generated_and_plain_ids():
 
 def test_generated_ids_pass_validation():
     # The validator must not reject what the extension itself creates.
-    body = _profiles.build_create_cluster(_profiles.SMALL, project="team-a")
+    body = _profiles.profile_to_spec("small", [SMALL_SPEC], project="team-a")
     assert _address.validate_cluster_id(body.id) == body.id
 
 
