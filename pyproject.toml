@@ -115,7 +115,7 @@ line-length = 100
 target-version = "py310"
 # Exclude the built labextension and template boilerplate that follows non-ruff
 # idioms (the Jupyter `c` config global in ui-tests, release scripts).
-extend-exclude = ["bifrost_jupyter/labextension", "node_modules", "ui-tests", ".github"]
+extend-exclude = ["bifrost_jupyter/labextension", "node_modules", "ui-tests", ".github", "examples"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "UP"]

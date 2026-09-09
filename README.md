@@ -265,6 +265,42 @@ REST contract is spoken directly over HTTP. Ray stays the optional
 `bifrost-jupyter[kernel]` extra, used only by the kernel-side `connect()`
 helper.
 
+## Example notebooks
+
+`examples/notebooks/` is the user-facing walkthrough, written to run unmodified in
+any Lab that has this extension — no `kubectl`, no Bifrost token, nothing to
+configure. A notebook calls the extension's own routes (`/user/<you>/bifrost/*`)
+with the server's hub token, so everything it does is what a click in the
+sidebar does, as you.
+
+| notebook                         | what it shows                                                                                                                                                                                                           |
+| -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `01-my-cluster.ipynb`            | the profiles your project may use; start a cluster from one (or reuse the one you have); a first job through `bifrost_jupyter.connect` and the Ray Jobs API                                                             |
+| `02-checkmaite-capability.ipynb` | `import checkmaite` against _your_ cluster: `configure_job_backend("ray", address=ray://…)`, a `DataevalCleaning` run over the demo dataset on the profile's analytics volume, results read back from the parquet store |
+| `03-stress-ramp.ipynb`           | a ramp of checkmaite runs, the cluster sampled every few seconds (nodes, CPUs, runs done), a plot, and a summary that says whether workers scaled up and back down — asserted when `EXPECT_AUTOSCALE=1`                 |
+| `04-cleanup.ipynb`               | delete the cluster (the profile's idle timeout / TTL would, eventually)                                                                                                                                                 |
+
+What they need from the platform, and what happens without it:
+
+- **A profile that mounts the analytics volume** (Bifrost `ProfileSpec.storage`). With it,
+  the demo datasets are on every node and results land on the volume. Without it, notebook 02
+  generates a small synthetic dataset and ships it with the `runtime_env`; results go to
+  `/tmp` on the cluster and vanish with it. The notebook says which path it took.
+- **The same Python / Ray / checkmaite on the notebook and the cluster** (minor version).
+  checkmaite ships the capability by reference; notebook 02 checks and stops if they differ.
+- **`--ray-autoscaling` on the control plane, and a project in no pool or an elastic one.**
+  A cluster in a non-elastic Kueue pool is fixed-size by design; notebook 03 records
+  `autoscaled: false` and passes unless `EXPECT_AUTOSCALE=1`.
+
+Environment knobs: `BIFROST_PROFILE` (default `checkmaite`), `BIFROST_CLUSTER_ID`,
+`CHECKMAITE_DATA_ROOT` (default `/app/data/analytics`), `CHECKMAITE_DATASET` (default
+`demo-ic-baseline`), `STRESS_RUNS` (12), `STRESS_CPUS_PER_RUN` (2), `STRESS_CONCURRENCY` (3), `SCALE_DOWN_WAIT_S` (600),
+`EXPECT_AUTOSCALE`.
+
+The grace-e2e repository's `sim/notebooks.spec.ts` uploads these into alice's and bob's
+servers and executes them with `jupyter nbconvert --execute`, both users at once, as the
+simulation lane's evidence that the walkthrough holds.
+
 ## Viewing the Ray dashboard
 
 Each running cluster gets a **Dashboard** button in the panel. It opens the
