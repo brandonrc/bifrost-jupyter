@@ -294,7 +294,7 @@ What they need from the platform, and what happens without it:
 
 Environment knobs: `BIFROST_PROFILE` (default `checkmaite`), `BIFROST_CLUSTER_ID`,
 `CHECKMAITE_DATA_ROOT` (default `/app/data/analytics`), `CHECKMAITE_DATASET` (default
-`demo-ic-baseline`), `STRESS_RUNS` (12), `STRESS_CPUS_PER_RUN` (1), `SCALE_DOWN_WAIT_S` (600),
+`demo-ic-baseline`), `STRESS_RUNS` (12), `STRESS_CPUS_PER_RUN` (2), `STRESS_CONCURRENCY` (3), `SCALE_DOWN_WAIT_S` (600),
 `EXPECT_AUTOSCALE`.
 
 The grace-e2e repository's `sim/notebooks.spec.ts` uploads these into alice's and bob's
