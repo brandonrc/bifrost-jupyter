@@ -37,6 +37,8 @@ plain checkmaite.
 | 5 | The analytics volume is `0750 uid 999` (`app` in both images). A profile on a uid-1000 image (rayproject) cannot write it. | image / hostPath perms | constraint, documented |
 | 6 | Cluster image has `polars` (parquet works) but not `pyarrow`, `s3fs`, `datamaite`; an S3 `analytics_store` would need `s3fs`. | checkmaite-api image | add if S3 stores are wanted |
 | 7 | `import checkmaite` writes `~/.cache/checkmaite`; fine in pods (writable `$HOME`), fails in a bare `docker run`. | checkmaite | cosmetic |
+| 8 | **Concurrency is bounded by head memory, not CPU.** Eight concurrent `DataevalCleaning` runs over 24 tiny images, 1 CPU each, on the 2-CPU/8 Gi head: Ray's memory monitor OOM-killed two of them (each run imports torch/dataeval in its own worker process). Runs that ask for a whole worker's CPUs (`resources={"num_cpus": 2}`) never fit on the head, queue, and pull workers in instead — the shape `03-stress-ramp.ipynb` uses. A per-run memory request (`resources={"memory": ...}`) would make the placement explicit. | checkmaite job backend defaults / profile head size | finding, recorded in the notebook |
+| 9 | The head's Ray Client proxier forks a server per connection; under quick successive connects it occasionally dies at birth (`ev_epoll1_linux.cc: Check failed: next_worker->state == KICKED`) and the client sees `ConnectionAbortedError`. The notebooks reuse one connection where they can and retry the reconnect. | Ray | upstream flake; retry |
 
 ## 2. A UI user runs checkmaite through the frontend API
 
@@ -51,9 +53,9 @@ checks every run's recorded owner.
 
 | # | delta | where | status |
 |---|---|---|---|
-| 8 | The deployed API is a dev build (`0.3.0.post1.dev0+293621c`) carrying the unmerged `ray_jobs` backend (!617) and the gateway token exchange (!619). Release checkmaite cannot talk to Bifrost's gateway. | checkmaite | unmerged upstream |
-| 9 | The shared cluster is **not autoscaled**: created before the flag (generation 4, `enableInTreeAutoscaling: false`, workers fixed at 1 of max 3). Re-applying it under autoscaling (a spec bump) restarts the head; the API's jobs backend reconnects, in-flight runs fail. | grace operations | do it in a quiet window, then re-run `checkmaite-load` for the scaling evidence |
-| 10 | Isolation on this path is checkmaite's, not Bifrost's: one owner, one cluster, one NetworkPolicy. Per-user quotas would have to be checkmaite-side or the API would need to start per-user clusters (path 1's model). | design | known; acceptable for a shared service account |
+| 10 | The deployed API is a dev build (`0.3.0.post1.dev0+293621c`) carrying the unmerged `ray_jobs` backend (!617) and the gateway token exchange (!619). Release checkmaite cannot talk to Bifrost's gateway. | checkmaite | unmerged upstream |
+| 11 | The shared cluster is **not autoscaled**: created before the flag (generation 4, `enableInTreeAutoscaling: false`, workers fixed at 1 of max 3). Re-applying it under autoscaling (a spec bump) restarts the head; the API's jobs backend reconnects, in-flight runs fail. | grace operations | do it in a quiet window, then re-run `checkmaite-load` for the scaling evidence |
+| 12 | Isolation on this path is checkmaite's, not Bifrost's: one owner, one cluster, one NetworkPolicy. Per-user quotas would have to be checkmaite-side or the API would need to start per-user clusters (path 1's model). | design | known; acceptable for a shared service account |
 
 ## 3. Users only reach their own resources; does it scale?
 
