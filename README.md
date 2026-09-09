@@ -273,12 +273,12 @@ configure. A notebook calls the extension's own routes (`/user/<you>/bifrost/*`)
 with the server's hub token, so everything it does is what a click in the
 sidebar does, as you.
 
-| notebook | what it shows |
-|---|---|
-| `01-my-cluster.ipynb` | the profiles your project may use; start a cluster from one (or reuse the one you have); a first job through `bifrost_jupyter.connect` and the Ray Jobs API |
-| `02-checkmaite-capability.ipynb` | `import checkmaite` against *your* cluster: `configure_job_backend("ray", address=ray://…)`, a `DataevalCleaning` run over the demo dataset on the profile's analytics volume, results read back from the parquet store |
-| `03-stress-ramp.ipynb` | a ramp of checkmaite runs, the cluster sampled every few seconds (nodes, CPUs, runs done), a plot, and a summary that says whether workers scaled up and back down — asserted when `EXPECT_AUTOSCALE=1` |
-| `04-cleanup.ipynb` | delete the cluster (the profile's idle timeout / TTL would, eventually) |
+| notebook                         | what it shows                                                                                                                                                                                                           |
+| -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `01-my-cluster.ipynb`            | the profiles your project may use; start a cluster from one (or reuse the one you have); a first job through `bifrost_jupyter.connect` and the Ray Jobs API                                                             |
+| `02-checkmaite-capability.ipynb` | `import checkmaite` against _your_ cluster: `configure_job_backend("ray", address=ray://…)`, a `DataevalCleaning` run over the demo dataset on the profile's analytics volume, results read back from the parquet store |
+| `03-stress-ramp.ipynb`           | a ramp of checkmaite runs, the cluster sampled every few seconds (nodes, CPUs, runs done), a plot, and a summary that says whether workers scaled up and back down — asserted when `EXPECT_AUTOSCALE=1`                 |
+| `04-cleanup.ipynb`               | delete the cluster (the profile's idle timeout / TTL would, eventually)                                                                                                                                                 |
 
 What they need from the platform, and what happens without it:
 
