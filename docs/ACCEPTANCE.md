@@ -170,8 +170,8 @@ and the operator role mapping.
    observed through the Bifrost API at all**. Check it in-cluster:
 
    ```bash
-   kubectl get raycluster <id> -n <ns> -o jsonpath='{.metadata.labels.bifrost\.dev/owner}'
-   kubectl get pod <singleuser-pod> -o jsonpath='{.metadata.labels.bifrost\.dev/owner}'
+   kubectl get raycluster <id> -n <ns> -o jsonpath='{.metadata.labels.bifrost-compute\.dev/owner}'
+   kubectl get pod <singleuser-pod> -o jsonpath='{.metadata.labels.bifrost-compute\.dev/owner}'
    ```
 
    They must be equal. If they are not, the tell is asymmetric and easy to
