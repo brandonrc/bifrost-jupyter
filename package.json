@@ -7,9 +7,9 @@
         "jupyterlab",
         "jupyterlab-extension"
     ],
-    "homepage": "https://github.com/brandonrc/bifrost-jupyter",
+    "homepage": "https://github.com/bifrost-compute/bifrost-jupyter",
     "bugs": {
-        "url": "https://github.com/brandonrc/bifrost-jupyter/issues"
+        "url": "https://github.com/bifrost-compute/bifrost-jupyter/issues"
     },
     "license": "Apache-2.0",
     "author": {
@@ -26,7 +26,7 @@
     "style": "style/index.css",
     "repository": {
         "type": "git",
-        "url": "https://github.com/brandonrc/bifrost-jupyter.git"
+        "url": "https://github.com/bifrost-compute/bifrost-jupyter.git"
     },
     "scripts": {
         "build": "jlpm build:lib && jlpm build:labextension:dev",
