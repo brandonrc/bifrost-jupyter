@@ -112,7 +112,7 @@ lifecycle needs the operator role and that an admin must map the group.
 
 Bifrost stamps `ClusterSpec.owner` from the **request identity** —
 `preferred_username` when the token carries one, else `sub` — and the per-owner
-NetworkPolicy admits only the pod labeled `bifrost.dev/owner: <that owner>` to
+NetworkPolicy admits only the pod labeled `bifrost-compute.dev/owner: <that owner>` to
 the cluster's `:8265` (Jobs API + dashboard) and `:10001` (Ray Client). So **the
 identity the extension presents must equal the identity that labels the notebook
 pod**. OIDC passthrough is what guarantees that: the token is the user's own, so
@@ -140,7 +140,7 @@ Bifrost source, that is not usable on the production OIDC path:
   field. `IssueToken` looks the user up by `user.Username`, and that same
   `user.Username` is what a PAT's identity returns as its owner. Making the mint
   succeed therefore _requires_ `Username == sub` — which is exactly what then
-  stamps the wrong `bifrost.dev/owner` and silently breaks the owner match
+  stamps the wrong `bifrost-compute.dev/owner` and silently breaks the owner match
   described above. No configuration satisfies both. (Group-derived project roles
   are lost as well, since local identities carry none.)
 
@@ -251,7 +251,7 @@ under `runtime_env.env_vars`, and returns the Ray submission id.
 
 Note this path does **not** go through Bifrost and carries **no bearer token**.
 Two things stand in for one. The jupyter-server extension runs inside the user's
-notebook pod, which carries the `bifrost.dev/owner` label, so the per-owner
+notebook pod, which carries the `bifrost-compute.dev/owner` label, so the per-owner
 NetworkPolicy admits it to the head service on `:8265`; **and** the cluster id is
 validated to a single DNS label before it is interpolated into that host, which
 pins the target to a head service in the configured namespace. Reachability alone

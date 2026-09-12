@@ -7,7 +7,7 @@ Jobs REST API on the cluster's head service.
 
 **No auth header, deliberately.** Unlike every Bifrost control-plane call, this
 path does not go through Bifrost at all — the jupyter-server extension runs
-inside the user's notebook pod, which carries the ``bifrost.dev/owner`` label,
+inside the user's notebook pod, which carries the ``bifrost-compute.dev/owner`` label,
 and the tier-2 per-owner NetworkPolicy (``kuberay.go``) admits exactly that pod
 to the head service on :8265. There is no bearer token on this path and none must
 be added.

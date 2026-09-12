@@ -502,7 +502,7 @@ class _RayJobsHandler(_BifrostHandler):
     NOTE: these routes do **not** talk to Bifrost. They talk straight to the
     cluster's own Ray head service (``<id>-head-svc.<ns>.svc:8265``), exactly
     like ``/clusters/{id}/address``. The jupyter-server extension runs inside the
-    user's notebook pod, which carries the ``bifrost.dev/owner`` label, so the
+    user's notebook pod, which carries the ``bifrost-compute.dev/owner`` label, so the
     per-owner NetworkPolicy admits it to :8265. The gate here is that NetworkPolicy
     **plus** the validated cluster id (see :class:`_ClusterIdMixin`) that pins the
     target to a head service in the configured namespace — **not** a bearer token.
