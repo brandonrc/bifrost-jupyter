@@ -11,7 +11,7 @@
     "bugs": {
         "url": "https://github.com/brandonrc/bifrost-jupyter/issues"
     },
-    "license": "BSD-3-Clause",
+    "license": "Apache-2.0",
     "author": {
         "name": "Brandon Geraci",
         "email": "brandon.geraci@gmail.com"
